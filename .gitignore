@@ -7,11 +7,11 @@ venv/
 # Generated Sound Charting outputs
 *.adofai
 silence*.ogg
-*_sound_chart.ogg
 
 # Source audio is intentionally not tracked
 *.mp3
 *.wav
+*.ogg
 *.flac
 *.m4a
 *.aac
