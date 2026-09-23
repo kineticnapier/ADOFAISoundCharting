@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Generated Sound Charting outputs
+*.adofai
+silence*.ogg
+*_sound_chart.ogg
+
+# Source audio is intentionally not tracked
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.aac
+*.opus
+
+# Keep repository-provided documentation/assets if explicitly added later
+!README.md
