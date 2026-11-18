@@ -364,6 +364,7 @@ def write_playsound_chart(
     env: "Envelope | None",
     gate: float,
     compact: bool = False,
+    play_duration: int = 0,
 ) -> tuple[int, int]:
     """Few straight tiles at a constant BPM; the audio is PlaySound events.
 
@@ -381,17 +382,22 @@ def write_playsound_chart(
     first = True
     # Field set/order copied from an editor-saved PlaySound event.
     # compact=True drops the fields left at their editor defaults.
+    # playDuration (ms, int) makes the game call SetScheduledEndTime, so each
+    # voice dies after that time. Concurrent voices ~= events/s * duration;
+    # with the full clip length thousands of AudioSources overlap and Unity
+    # culls most of them.
     if compact:
         head = (
             '{"floor":%d,"eventType":"PlaySound","hitsound":'
             + json.dumps(hitsound)
+            + (',"playDuration":%d' % play_duration if play_duration else "")
             + ',"hitsoundVolume":%d,"angleOffset":%.7g}'
         )
     else:
         head = (
             '{"floor":%d,"eventType":"PlaySound","hitsound":'
             + json.dumps(hitsound)
-            + ',"offset":0,"playDuration":0,"pitch":100'
+            + ',"offset":0,"playDuration":%d,"pitch":100' % play_duration
             + ',"hitsoundVolume":%d,"angleOffset":%.7g,"eventTag":""}'
         )
     deg_per_sample = 180.0 / tile_len
@@ -480,6 +486,13 @@ def parse_args() -> argparse.Namespace:
         help="playsound: duration of one straight tile in milliseconds",
     )
     p.add_argument(
+        "--play-duration",
+        type=int,
+        default=1,
+        help="playsound: cut each PlaySound after this many ms (0 = full clip). "
+        "Keeps concurrent voices ~= events/s * duration below Unity's voice limit",
+    )
+    p.add_argument(
         "--compact-events",
         action="store_true",
         help="playsound: omit offset/playDuration/pitch/eventTag (smaller JSON; "
@@ -564,6 +577,10 @@ def main() -> int:
         raise SystemExit("--tile-ms must be positive")
     if args.volume_max <= 0:
         raise SystemExit("--volume-max must be positive")
+    if args.volume_max > 100:
+        raise SystemExit("--volume-max must be <= 100 (AudioSource volume is clamped to 1)")
+    if args.play_duration < 0:
+        raise SystemExit("--play-duration must be >= 0")
 
     output = args.output or args.input.with_name(args.input.stem + "_sound_chart.adofai")
     if output.suffix.lower() != ".adofai":
@@ -638,6 +655,7 @@ def main() -> int:
                 env=env,
                 gate=gate,
                 compact=args.compact_events,
+                play_duration=args.play_duration,
             )
             del pcm
             print("[4/4] Creating silent background OGG...")
@@ -649,6 +667,9 @@ def main() -> int:
             print(f"tiles      : {tiles:,} (BPM {bpm:.10g})")
             print(f"PlaySound  : {events:,} ({events / duration:,.0f}/s, "
                   f"avg volume {volume_sum / max(events, 1):.1f})")
+            if args.play_duration:
+                print(f"voices     : ~{events / duration * args.play_duration / 1000:,.1f} "
+                      f"concurrent (playDuration {args.play_duration} ms)")
             print(f"file size  : {size / 1e6:,.1f} MB")
             print(f"chart      : {output}")
             print(f"silence    : {silence}")

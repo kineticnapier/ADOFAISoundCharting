@@ -129,6 +129,11 @@ Audio -> mono PCM at --rate (default 11025 Hz)
   sample instead of a 1-bit pulse. That needs far fewer events than PDM for the
   same quality.
 - The global tile hitsound volume is set to 0; only PlaySound is audible.
+- Every hit (tile or PlaySound) is a separate Unity `AudioSource.PlayScheduled`;
+  the game does not pre-mix hitsounds. With full-length clips thousands of
+  voices overlap and most get culled. `--play-duration` (default 1 ms) sets
+  PlaySound's `playDuration`, which ends each voice early, so concurrent voices
+  ≈ events/s × duration (≈8 at 8 kHz). Tile hitsounds have no such control.
 - Events/s ≈ `--rate` during loud passages; silence emits nothing.
 - `--rate` sets the bandwidth (≈ rate/2). Below ~8 kHz the sample-rate images
   fall inside the audible band.
