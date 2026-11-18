@@ -577,19 +577,21 @@ def main() -> int:
             names = ", ".join(str(p) for p in existing)
             raise SystemExit(f"Output already exists: {names} (use --force to overwrite)")
 
+    steps = 4 if args.engine == "playsound" else 5
+
     with tempfile.TemporaryDirectory(prefix="adofai_sound_chart_") as tmp:
         tmpdir = Path(tmp)
         raw_path = tmpdir / "audio.f32le"
         hit_path = tmpdir / "hits.i64"
 
-        print(f"[1/5] Decoding mono PCM at {args.rate:,} Hz...")
+        print(f"[1/{steps}] Decoding mono PCM at {args.rate:,} Hz...")
         sample_count = decode_mono_f32(args.input, raw_path, args.rate)
         if sample_count == 0:
             raise SystemExit("Decoded audio is empty")
         duration = sample_count / args.rate
         pcm = np.memmap(raw_path, dtype="<f4", mode="r", shape=(sample_count,))
 
-        print("[2/5] Estimating normalization...")
+        print(f"[2/{steps}] Estimating normalization...")
         scale = estimate_abs_percentile(pcm, args.percentile)
         print(f"      abs p{args.percentile:g} = {scale:.8g}")
 
