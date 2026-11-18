@@ -350,24 +350,161 @@ def angle_path(gaps: np.ndarray, base_gap: float) -> tuple[np.ndarray, np.ndarra
     return theta, mult
 
 
-def write_angles(f, hits: np.memmap, base_gap: float | None) -> None:
+def alternative_angles(theta: np.ndarray, mult: np.ndarray):
+    """Second valid (angle, multiplier) per floor, NaN where there is none.
+
+    90..135 deg can also be played as 180..270 at double speed, and 180..270
+    as 90..135 at half speed; 135..180 has only one form.
+    """
+    alt_t = np.full_like(theta, np.nan)
+    alt_m = np.full_like(mult, np.nan)
+    lo = theta <= 135.0
+    hi = theta >= 180.0
+    alt_t[lo], alt_m[lo] = theta[lo] * 2.0, mult[lo] * 2.0
+    alt_t[hi], alt_m[hi] = theta[hi] * 0.5, mult[hi] * 0.5
+    return alt_t, alt_m
+
+
+def tile_positions(theta: np.ndarray) -> np.ndarray:
+    """Positions of floors 1.. for an angle path (floor 0 at the origin)."""
+    a = np.radians(np.concatenate([[0.0], np.cumsum(180.0 - theta)]))
+    return np.cumsum(np.c_[np.cos(a), np.sin(a)], axis=0)
+
+
+def overlap_ratio(theta: np.ndarray) -> float:
+    """Fraction of floors that land on a grid cell another floor already used."""
+    pos = tile_positions(theta)
+    cells = np.round(pos).astype(np.int64)
+    key = cells[:, 0] * 4_294_967_296 + cells[:, 1]
+    return 1.0 - len(np.unique(key)) / max(1, len(key))
+
+
+STEER_GRID_BITS = 12          # hashed occupancy grid 4096 x 4096 (wraps around)
+STEER_RECENT = 4              # the last few floors never count as overlap
+STEER_SPEED_PENALTY = 0.05    # cost of one extra SetSpeed vs. one overlap
+STEER_SPREAD = 0.0            # reward per tile of distance from the start
+
+
+def steer_angles(
+    theta: np.ndarray,
+    mult: np.ndarray,
+    depth: int,
+    progress: bool = True,
+    spread: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pick, at every floor that has two valid angles, the one whose future is
+    least overlapping: all 2^depth combinations of the next `depth` choice
+    floors are tried (the look-ahead is the cut-off) and the first half of the
+    best combination is committed before searching again.
+
+    Cost = floors landing on an already-used cell (ignoring the last few
+    floors) + a small penalty per speed change.
+    """
+    spread_w = STEER_SPREAD if spread is None else spread
+    theta = theta.copy()
+    mult = mult.copy()
+    alt_t, alt_m = alternative_angles(theta, mult)
+    choices = np.flatnonzero(~np.isnan(alt_t))
+    n = len(theta)
+    if not len(choices) or depth <= 0:
+        return theta, mult
+
+    size = 1 << STEER_GRID_BITS
+    mask = size - 1
+    grid = np.full((size, size), -1_000_000, dtype=np.int64)
+    combos = {}
+
+    # State before gap i: heading of floor i, position of floor i+1.
+    heading = 0.0
+    pos = np.array([1.0, 0.0])
+    grid[0, 0] = 0
+    grid[1, 0] = 1
+    prev_logm = 0.0
+    done = 0  # next gap index not yet committed
+    ci = 0
+    commit = max(1, depth // 2)
+    total = len(choices)
+    next_report = 0
+
+    def walk(g0: int, g1: int) -> None:
+        nonlocal heading, pos, prev_logm
+        if g1 <= g0:
+            return
+        hd = heading + np.cumsum(180.0 - theta[g0:g1])
+        r = np.radians(hd)
+        pts = pos + np.cumsum(np.c_[np.cos(r), np.sin(r)], axis=0)
+        cells = np.round(pts).astype(np.int64) & mask
+        grid[cells[:, 0], cells[:, 1]] = np.arange(g0 + 2, g1 + 2)
+        heading = float(np.mod(hd[-1], 360.0))
+        pos = pts[-1]
+        prev_logm = float(np.log2(mult[g1 - 1]))
+
+    while ci < total:
+        if progress and ci >= next_report:
+            print(f"      steering {ci / total:6.1%}", end="\r", flush=True)
+            next_report = ci + max(1, total // 200)
+        c = choices[ci:ci + depth]
+        k = len(c)
+        g0 = int(c[0])
+        g1 = min(n, int(c[-1]) + 1 + STEER_RECENT)
+        walk(done, g0)
+        done = g0
+
+        if k not in combos:
+            combos[k] = ((np.arange(1 << k)[:, None] >> np.arange(k)) & 1).astype(bool)
+        bits = combos[k]
+        L = g1 - g0
+        th = np.broadcast_to(theta[g0:g1], (len(bits), L)).copy()
+        lm = np.broadcast_to(np.log2(mult[g0:g1]), (len(bits), L)).copy()
+        cols = c - g0
+        th[:, cols] = np.where(bits, alt_t[c], theta[c])
+        lm[:, cols] = np.where(bits, np.log2(alt_m[c]), np.log2(mult[c]))
+
+        hd = heading + np.cumsum(180.0 - th, axis=1)
+        r = np.radians(hd)
+        pts = pos + np.stack(
+            [np.cumsum(np.cos(r), axis=1), np.cumsum(np.sin(r), axis=1)], axis=2
+        )
+        cells = np.round(pts).astype(np.int64) & mask
+        last = grid[cells[..., 0], cells[..., 1]]
+        idx = np.arange(g0 + 2, g1 + 2)
+        overlaps = ((idx - last) > STEER_RECENT).sum(axis=1)
+        changes = (np.diff(np.c_[np.full(len(bits), prev_logm), lm], axis=1) != 0).sum(axis=1)
+        spread = np.hypot(pts[:, -1, 0], pts[:, -1, 1])
+        best = int(np.argmin(
+            overlaps + STEER_SPEED_PENALTY * changes - spread_w * spread
+        ))
+
+        m = min(commit, k)
+        pick = bits[best, :m]
+        sel = c[:m][pick]
+        theta[sel], mult[sel] = alt_t[sel], alt_m[sel]
+        g_end = int(c[m]) if m < k else int(c[-1]) + 1
+        walk(g0, g_end)
+        done = g_end
+        ci += m
+
+    walk(done, n)
+    if progress:
+        print(" " * 40, end="\r")
+    return theta, mult
+
+
+def write_angles(f, n: int, theta: np.ndarray | None) -> None:
     """angleData: floor 0 plus one entry per hit floor (len(hits) values).
 
     Straight path: all zeros. Angle path: the game computes the turn on floor j
     as mod(a[j-1] - a[j] - 180, 360) (exit = 90 - angleData, entry = previous
     exit + 180, clockwise), so a[j] = a[j-1] + 180 - theta[j].
     """
-    n = len(hits)
-    if base_gap is None:
+    if theta is None:
         write_zero_angles(f, n)
         return
     f.write("0")
     carry = 0.0
     for start in range(0, n - 1, PCM_CHUNK_SAMPLES):
         end = min(start + PCM_CHUNK_SAMPLES, n - 1)
-        h = np.asarray(hits[start:end + 1], dtype=np.int64)
-        theta, _ = angle_path(np.diff(h), base_gap)
-        a = np.mod(carry + np.cumsum(180.0 - theta), 360.0)
+        a = np.mod(carry + np.cumsum(180.0 - theta[start:end]), 360.0)
         carry = float(a[-1])
         for c in range(0, len(a), ANGLE_BLOCK):
             f.write(",")
@@ -382,6 +519,7 @@ def write_actions(
     volumes: np.memmap | None = None,
     hitsound: str = "Sidestick",
     base_gap: float | None = None,
+    mult: np.ndarray | None = None,
 ) -> tuple[int, int]:
     """Write SetSpeed (and optionally SetHitsound) events for a hit timeline.
 
@@ -419,7 +557,7 @@ def write_actions(
         if base_bpm is None:
             speeds = 60.0 * rate / gaps
         else:
-            speeds = base_bpm * angle_path(gaps, base_gap)[1]
+            speeds = base_bpm * mult[start:start + len(gaps)]
         s_prev = np.concatenate([[prev_speed], speeds[:-1]]) if len(speeds) else speeds
         sp_idx = np.flatnonzero(speeds != s_prev)
         if len(speeds):
@@ -462,15 +600,18 @@ def write_chart(
     volumes: np.memmap | None = None,
     hitsound: str = "Sidestick",
     base_gap: float | None = None,
+    theta: np.ndarray | None = None,
+    mult: np.ndarray | None = None,
 ) -> tuple[int, int]:
     with output.open("w", encoding="utf-8", buffering=1024 * 1024) as f:
         f.write('{"angleData":[')
-        write_angles(f, hits, base_gap)  # floor 0 + one floor per hit
+        write_angles(f, len(hits), theta)  # floor 0 + one floor per hit
         f.write('],"settings":')
         f.write(json.dumps(settings, ensure_ascii=False, separators=(",", ":")))
         f.write(',"actions":[')
         counts = write_actions(
-            f, hits, rate, volumes=volumes, hitsound=hitsound, base_gap=base_gap
+            f, hits, rate, volumes=volumes, hitsound=hitsound, base_gap=base_gap,
+            mult=mult,
         )
         f.write('],"decorations":[]}')
     return counts
@@ -685,6 +826,21 @@ def parse_args() -> argparse.Namespace:
         help="angle: constant average BPM, gaps encoded as turn angles kept in "
         "90-270 deg by doubling/halving the speed. straight: all-straight route, "
         "every gap change is a SetSpeed (pdm/tiles engines)",
+    )
+    p.add_argument(
+        "--steer-depth",
+        type=int,
+        default=4,
+        help="angle path: look-ahead depth (choice floors) when choosing between "
+        "the two valid angle/speed forms to avoid overlaps; tries 2^depth "
+        "combinations per step. 0 = off",
+    )
+    p.add_argument(
+        "--steer-spread",
+        type=float,
+        default=0.0,
+        help="angle path: reward for moving away from the start while steering. "
+        "Even 0.002 turns the path into a near-straight line; 0 keeps it a cloud",
     )
     p.add_argument(
         "--rate",
@@ -961,11 +1117,21 @@ def main() -> int:
         initial_gap = max(1, int(hits[0]))
         initial_bpm = bpm_for_gap(args.rate, initial_gap)
         base_gap = None
+        theta = mult = None
         if args.path == "angle":
             base_gap = (
                 (int(hits[-1]) - int(hits[0])) / (floors - 1) if floors > 1 else float(initial_gap)
             )
             initial_bpm = bpm_for_gap_f(args.rate, base_gap)
+            theta, mult = angle_path(np.diff(np.asarray(hits, dtype=np.int64)), base_gap)
+            if args.steer_depth > 0 and len(theta):
+                before = overlap_ratio(theta)
+                print(f"[4/5] Steering path (depth {args.steer_depth}, "
+                      f"2^{args.steer_depth} futures per step)...")
+                theta, mult = steer_angles(
+                    theta, mult, args.steer_depth, spread=args.steer_spread
+                )
+                print(f"      overlapping floors: {before:.1%} -> {overlap_ratio(theta):.1%}")
         first_volume = int(volumes[0]) if volumes is not None else 100
 
         title = args.title or f"{args.input.stem} [Sound Charting]"
@@ -991,6 +1157,8 @@ def main() -> int:
         speed_events, volume_events = write_chart(
             output, hits, settings, args.rate, volumes=volumes, hitsound=args.hitsound,
             base_gap=base_gap,
+            theta=theta,
+            mult=mult,
         )
         del hits, volumes
 

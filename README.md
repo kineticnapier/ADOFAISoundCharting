@@ -122,6 +122,22 @@ Turn on floor j follows the game code: `mod(a[j-1] − a[j] − 180, 360)`
 10 s clip, 100k tiles: straight 65,402 SetSpeed / 7.7 MB → angle 37,491 SetSpeed /
 5.4 MB, same timing (simulated SNR 6.5 → 6.8 dB).
 
+**Steering** (`--steer-depth`, default 4): floors at 90–135° can also be played
+at 180–270° with double speed (and vice versa), same timing. At each such floor
+all 2^depth combinations of the next `depth` choice floors are simulated (the
+depth is the cut-off) and the first half of the best one is committed. Cost =
+floors landing on an already-used cell + 0.05 per speed change
+− `--steer-spread` × distance from the start.
+
+10 s clip, 100k tiles (overlap = floors on an already-used grid cell):
+
+| setting | overlap | SetSpeed |
+|---|---|---|
+| `--steer-depth 0` | 64% | 36,606 |
+| default (depth 4) | 48% | 17,838 |
+| `--steer-spread 0.002` | 23% | 17,309 (near-straight line) |
+| `--steer-spread 0.1` | 7% | 41,714 (straight line) |
+
 `straight`: every tile is 180°, every gap change is a SetSpeed (previous behaviour).
 
 ### `--engine tiles`
