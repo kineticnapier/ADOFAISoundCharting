@@ -363,6 +363,7 @@ def write_playsound_chart(
     gain: float,
     env: "Envelope | None",
     gate: float,
+    compact: bool = False,
 ) -> tuple[int, int]:
     """Few straight tiles at a constant BPM; the audio is PlaySound events.
 
@@ -378,11 +379,21 @@ def write_playsound_chart(
     acc = 0.0
     prev_level = 0
     first = True
-    head = (
-        '{"floor":%d,"eventType":"PlaySound","hitsound":'
-        + json.dumps(hitsound)
-        + ',"hitsoundVolume":%d,"angleOffset":%.7g}'
-    )
+    # Field set/order copied from an editor-saved PlaySound event.
+    # compact=True drops the fields left at their editor defaults.
+    if compact:
+        head = (
+            '{"floor":%d,"eventType":"PlaySound","hitsound":'
+            + json.dumps(hitsound)
+            + ',"hitsoundVolume":%d,"angleOffset":%.7g}'
+        )
+    else:
+        head = (
+            '{"floor":%d,"eventType":"PlaySound","hitsound":'
+            + json.dumps(hitsound)
+            + ',"offset":0,"playDuration":0,"pitch":100'
+            + ',"hitsoundVolume":%d,"angleOffset":%.7g,"eventTag":""}'
+        )
     deg_per_sample = 180.0 / tile_len
 
     with output.open("w", encoding="utf-8", buffering=1024 * 1024) as f:
@@ -467,6 +478,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_TILE_MS,
         help="playsound: duration of one straight tile in milliseconds",
+    )
+    p.add_argument(
+        "--compact-events",
+        action="store_true",
+        help="playsound: omit offset/playDuration/pitch/eventTag (smaller JSON; "
+        "only if the game accepts events without them)",
     )
     p.add_argument(
         "--volume-max",
@@ -615,6 +632,7 @@ def main() -> int:
                 gain=args.gain,
                 env=env,
                 gate=gate,
+                compact=args.compact_events,
             )
             del pcm
             print("[4/4] Creating silent background OGG...")

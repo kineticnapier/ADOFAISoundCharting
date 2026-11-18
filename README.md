@@ -145,8 +145,14 @@ Audio -> mono PCM at --rate (default 11025 Hz)
 A 3-minute song at 11025 Hz is roughly 2M events / 200 MB of JSON; at 8000 Hz
 roughly 1.4M events / 145 MB. Lower `--rate` or cut the song if parsing is too slow.
 
-> The PlaySound JSON (`hitsound`, `hitsoundVolume`, `angleOffset`) has not been
-> verified against an editor-saved file yet.
+Events use the editor's field set:
+
+```json
+{"floor":1,"eventType":"PlaySound","hitsound":"Sidestick","offset":0,"playDuration":0,"pitch":100,"hitsoundVolume":47,"angleOffset":0.225,"eventTag":""}
+```
+
+`--compact-events` drops `offset`/`playDuration`/`pitch`/`eventTag` (~35% smaller
+JSON) if the game accepts events without them.
 
 ### `--engine pdm`
 
