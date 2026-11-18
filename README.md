@@ -109,6 +109,21 @@ Large inputs can create **hundreds of megabytes of JSON** and millions of tiles/
 
 ## Engines
 
+### `--path angle` (default) / `--path straight`
+
+`angle`: the whole chart runs at the **average BPM** (`60·Fs / mean gap`) and each
+gap is a turn angle `180·g / mean_gap`. If the angle is < 90° the speed and the
+angle are doubled, if it is > 270° both are halved (repeated as needed), so every
+turn stays in 90–270° and SetSpeed only appears when that ×2ⁿ factor changes.
+Turn on floor j follows the game code: `mod(a[j-1] − a[j] − 180, 360)`
+(exit = 90 − angleData, entry = previous exit + 180, clockwise), so
+`a[j] = a[j-1] + 180 − θ[j]`.
+
+10 s clip, 100k tiles: straight 65,402 SetSpeed / 7.7 MB → angle 37,491 SetSpeed /
+5.4 MB, same timing (simulated SNR 6.5 → 6.8 dB).
+
+`straight`: every tile is 180°, every gap change is a SetSpeed (previous behaviour).
+
 ### `--engine tiles`
 
 One straight tile per non-zero sample; the hit **volume** carries the amplitude.

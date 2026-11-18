@@ -176,6 +176,10 @@ def encode_pdm_hits(
     return total_hits
 
 
+def bpm_for_gap_f(rate: int, gap: float) -> float:
+    return 60.0 * rate / gap
+
+
 def bpm_for_gap(rate: int, gap: int) -> float:
     return 60.0 * rate / max(1, int(gap))
 
@@ -277,6 +281,63 @@ def write_zero_angles(f, count: int) -> None:
         f.write(",".join(["0"] * rem))
 
 
+ANGLE_MIN = 90.0
+ANGLE_MAX = 270.0
+
+
+def angle_path(gaps: np.ndarray, base_gap: float) -> tuple[np.ndarray, np.ndarray]:
+    """Turn angle (deg) and speed multiplier for each gap at the base BPM.
+
+    At the base BPM a gap of g samples is 180 * g / base_gap degrees.
+    While the angle is < 90 the speed and the angle are doubled; while it is
+    > 270 both are halved. Travel time = angle/180 * 60/(bpm*mult) is unchanged.
+    """
+    theta = 180.0 * gaps.astype(np.float64) / base_gap
+    mult = np.ones_like(theta)
+    small = theta < ANGLE_MIN
+    if small.any():
+        k = np.ceil(np.log2(ANGLE_MIN / theta[small]))
+        mult[small] = 2.0 ** k
+    big = theta > ANGLE_MAX
+    if big.any():
+        k = np.ceil(np.log2(theta[big] / ANGLE_MAX))
+        mult[big] = 2.0 ** -k
+    theta = theta * mult
+    # Guard against log2 rounding at the boundaries.
+    for _ in range(2):
+        lo = theta < ANGLE_MIN
+        theta[lo] *= 2.0
+        mult[lo] *= 2.0
+        hi = theta > ANGLE_MAX
+        theta[hi] *= 0.5
+        mult[hi] *= 0.5
+    return theta, mult
+
+
+def write_angles(f, hits: np.memmap, base_gap: float | None) -> None:
+    """angleData: floor 0 plus one entry per hit floor (len(hits) values).
+
+    Straight path: all zeros. Angle path: the game computes the turn on floor j
+    as mod(a[j-1] - a[j] - 180, 360) (exit = 90 - angleData, entry = previous
+    exit + 180, clockwise), so a[j] = a[j-1] + 180 - theta[j].
+    """
+    n = len(hits)
+    if base_gap is None:
+        write_zero_angles(f, n)
+        return
+    f.write("0")
+    carry = 0.0
+    for start in range(0, n - 1, PCM_CHUNK_SAMPLES):
+        end = min(start + PCM_CHUNK_SAMPLES, n - 1)
+        h = np.asarray(hits[start:end + 1], dtype=np.int64)
+        theta, _ = angle_path(np.diff(h), base_gap)
+        a = np.mod(carry + np.cumsum(180.0 - theta), 360.0)
+        carry = float(a[-1])
+        for c in range(0, len(a), ANGLE_BLOCK):
+            f.write(",")
+            f.write(",".join("%.4f" % x for x in a[c:c + ANGLE_BLOCK].tolist()))
+
+
 def write_actions(
     f,
     hits: np.memmap,
@@ -284,6 +345,7 @@ def write_actions(
     *,
     volumes: np.memmap | None = None,
     hitsound: str = "Sidestick",
+    base_gap: float | None = None,
 ) -> tuple[int, int]:
     """Write SetSpeed (and optionally SetHitsound) events for a hit timeline.
 
@@ -298,7 +360,8 @@ def write_actions(
     speed_count = 0
     volume_count = 0
     first = True
-    prev_gap = -1
+    base_bpm = 60.0 * rate / base_gap if base_gap is not None else None
+    prev_speed = base_bpm if base_bpm is not None else -1.0
     prev_vol = int(volumes[0]) if volumes is not None and n else -1
     speed_fmt = (
         '{"floor":%d,"eventType":"SetSpeed","speedType":"Bpm",'
@@ -317,10 +380,14 @@ def write_actions(
         # Speed for floor j (travel to j+1): hits[j] - hits[j-1], for j < n.
         h = np.asarray(hits[start:min(end + 1, n)], dtype=np.int64)
         gaps = np.diff(h)  # gaps[i] belongs to floor start+1+i
-        g_prev = np.concatenate([[prev_gap], gaps[:-1]]) if len(gaps) else gaps
-        sp_idx = np.flatnonzero(gaps != g_prev)
-        if len(gaps):
-            prev_gap = int(gaps[-1])
+        if base_bpm is None:
+            speeds = 60.0 * rate / gaps
+        else:
+            speeds = base_bpm * angle_path(gaps, base_gap)[1]
+        s_prev = np.concatenate([[prev_speed], speeds[:-1]]) if len(speeds) else speeds
+        sp_idx = np.flatnonzero(speeds != s_prev)
+        if len(speeds):
+            prev_speed = float(speeds[-1])
 
         if volumes is not None:
             v = np.asarray(volumes[start:end], dtype=np.int64)
@@ -334,7 +401,7 @@ def write_actions(
             c1 = c0 + ACTION_CHUNK
             sp = sp_idx[(sp_idx >= c0) & (sp_idx < c1)]
             vo = vo_idx[(vo_idx >= c0) & (vo_idx < c1)]
-            items = [(int(i), 0, speed_fmt % (floors[i], 60.0 * rate / int(gaps[i])))
+            items = [(int(i), 0, speed_fmt % (floors[i], speeds[i]))
                      for i in sp.tolist()]
             items += [(int(i), 1, vol_fmt % (floors[i], int(v[i]))) for i in vo.tolist()]
             if not items:
@@ -358,15 +425,17 @@ def write_chart(
     *,
     volumes: np.memmap | None = None,
     hitsound: str = "Sidestick",
+    base_gap: float | None = None,
 ) -> tuple[int, int]:
-    floors = len(hits)
     with output.open("w", encoding="utf-8", buffering=1024 * 1024) as f:
         f.write('{"angleData":[')
-        write_zero_angles(f, floors)  # floor 0 + one floor per hit
+        write_angles(f, hits, base_gap)  # floor 0 + one floor per hit
         f.write('],"settings":')
         f.write(json.dumps(settings, ensure_ascii=False, separators=(",", ":")))
         f.write(',"actions":[')
-        counts = write_actions(f, hits, rate, volumes=volumes, hitsound=hitsound)
+        counts = write_actions(
+            f, hits, rate, volumes=volumes, hitsound=hitsound, base_gap=base_gap
+        )
         f.write('],"decorations":[]}')
     return counts
 
@@ -557,6 +626,14 @@ def parse_args() -> argparse.Namespace:
         "tiles: one tile per sample, volume via SetHitsound (multi-level). "
         "playsound: few tiles, audio in PlaySound events (needs a renderer that "
         "handles PlaySound)",
+    )
+    p.add_argument(
+        "--path",
+        choices=("angle", "straight"),
+        default="angle",
+        help="angle: constant average BPM, gaps encoded as turn angles kept in "
+        "90-270 deg by doubling/halving the speed. straight: all-straight route, "
+        "every gap change is a SetSpeed (pdm/tiles engines)",
     )
     p.add_argument(
         "--rate",
@@ -813,6 +890,12 @@ def main() -> int:
         )
         initial_gap = max(1, int(hits[0]))
         initial_bpm = bpm_for_gap(args.rate, initial_gap)
+        base_gap = None
+        if args.path == "angle":
+            base_gap = (
+                (int(hits[-1]) - int(hits[0])) / (floors - 1) if floors > 1 else float(initial_gap)
+            )
+            initial_bpm = bpm_for_gap_f(args.rate, base_gap)
         first_volume = int(volumes[0]) if volumes is not None else 100
 
         title = args.title or f"{args.input.stem} [Sound Charting]"
@@ -829,14 +912,15 @@ def main() -> int:
             hitsound_volume=first_volume,
             description=(
                 f"{args.rate} Hz {'multi-level SetHitsound' if volumes is not None else '1-bit PDM'} "
-                f"Sound Charting reconstruction, {floors:,} straight tiles. "
+                f"Sound Charting reconstruction, {floors:,} tiles ({args.path} path). "
                 "Background audio is silent."
             ),
         )
 
-        print(f"[4/5] Writing {floors:,} straight tiles...")
+        print(f"[4/5] Writing {floors:,} tiles ({args.path} path)...")
         speed_events, volume_events = write_chart(
-            output, hits, settings, args.rate, volumes=volumes, hitsound=args.hitsound
+            output, hits, settings, args.rate, volumes=volumes, hitsound=args.hitsound,
+            base_gap=base_gap,
         )
         del hits, volumes
 
@@ -851,7 +935,10 @@ def main() -> int:
     if args.engine == "tiles":
         print(f"SetHitsound: {volume_events:,}")
     print(f"file size  : {output.stat().st_size / 1e6:,.1f} MB")
-    print(f"max BPM    : {60 * args.rate:,.0f}")
+    if base_gap is not None:
+        print(f"base BPM   : {60 * args.rate / base_gap:,.3f} (avg gap {base_gap:.4f} samples)")
+    else:
+        print(f"max BPM    : {60 * args.rate:,.0f}")
     print(f"chart      : {output}")
     print(f"silence    : {silence}")
     return 0
