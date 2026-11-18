@@ -16,6 +16,9 @@ DEFAULT_GAIN = 1.35
 DEFAULT_PERCENTILE = 99.5
 DENSITY_CENTER = 0.5
 DENSITY_SPAN = 0.49
+DEFAULT_MAX_DENSITY = 0.98
+DEFAULT_ENV_MS = 10.0
+DEFAULT_GATE_DB = -60.0
 PCM_CHUNK_SAMPLES = 1_000_000
 ACTION_CHUNK = 50_000
 ANGLE_BLOCK = 200_000
@@ -51,12 +54,88 @@ def estimate_abs_percentile(pcm: np.memmap, percentile: float) -> float:
     return max(value, 1e-12)
 
 
+class Envelope:
+    """Look-ahead peak envelope of the soft-clipped signal.
+
+    Block peaks are max-filtered with their neighbours and linearly
+    interpolated between block centres, which guarantees env[n] >= |y[n]|.
+    """
+
+    def __init__(self, centers: np.ndarray, values: np.ndarray) -> None:
+        self.centers = centers
+        self.values = values
+
+    def at(self, start: int, end: int) -> np.ndarray:
+        idx = np.arange(start, end, dtype=np.float64)
+        return np.interp(idx, self.centers, self.values)
+
+
+def soft_clip(x: np.ndarray, *, scale: float, gain: float) -> np.ndarray:
+    return np.tanh(gain * np.asarray(x, dtype=np.float64) / scale)
+
+
+def compute_envelope(pcm: np.memmap, *, scale: float, gain: float, block: int) -> Envelope:
+    n = len(pcm)
+    blocks = -(-n // block)
+    peaks = np.zeros(blocks, dtype=np.float64)
+    chunk = max(block, (PCM_CHUNK_SAMPLES // block) * block)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        y = np.abs(soft_clip(pcm[start:end], scale=scale, gain=gain))
+        pad = (-len(y)) % block
+        if pad:
+            y = np.concatenate([y, np.zeros(pad)])
+        b0 = start // block
+        peaks[b0:b0 + len(y) // block] = y.reshape(-1, block).max(axis=1)
+
+    held = peaks.copy()
+    held[1:] = np.maximum(held[1:], peaks[:-1])
+    held[:-1] = np.maximum(held[:-1], peaks[1:])
+    centers = np.arange(blocks, dtype=np.float64) * block + (block - 1) / 2.0
+    return Envelope(centers, held)
+
+
+def base_density(
+    pcm: np.memmap,
+    start: int,
+    end: int,
+    *,
+    scale: float,
+    gain: float,
+    env: Envelope | None,
+    gate: float,
+) -> np.ndarray:
+    """Pulse density before max-density scaling.
+
+    classic  (env is None): 0.5 + 0.49*y      -> silence = 50% density
+    adaptive               : (env + y) / 2    -> silence = 0 density
+    """
+    y = soft_clip(pcm[start:end], scale=scale, gain=gain)
+    if env is None:
+        return DENSITY_CENTER + DENSITY_SPAN * np.clip(y, -1.0, 1.0)
+    e = env.at(start, end)
+    d = 0.5 * (e + y)
+    d[e < gate] = 0.0
+    return np.clip(d, 0.0, 1.0)
+
+
+def expected_pulses(pcm: np.memmap, **kw) -> float:
+    total = 0.0
+    for start in range(0, len(pcm), PCM_CHUNK_SAMPLES):
+        end = min(start + PCM_CHUNK_SAMPLES, len(pcm))
+        total += float(base_density(pcm, start, end, **kw).sum())
+    return total
+
+
 def encode_pdm_hits(
     pcm: np.memmap,
     hit_path: Path,
     *,
     scale: float,
     gain: float,
+    env: Envelope | None,
+    gate: float,
+    density_scale: float,
 ) -> int:
     """Encode mono PCM into first-order 1-bit PDM pulse positions.
 
@@ -69,9 +148,11 @@ def encode_pdm_hits(
     with hit_path.open("wb") as out:
         for start in range(0, len(pcm), PCM_CHUNK_SAMPLES):
             end = min(start + PCM_CHUNK_SAMPLES, len(pcm))
-            x = np.asarray(pcm[start:end], dtype=np.float64)
-            normalized = np.tanh(gain * x / scale)
-            density = DENSITY_CENTER + DENSITY_SPAN * np.clip(normalized, -1.0, 1.0)
+            density = base_density(
+                pcm, start, end, scale=scale, gain=gain, env=env, gate=gate
+            )
+            if env is not None:
+                density *= density_scale
 
             cumulative = accumulator + np.cumsum(density, dtype=np.float64)
             levels = np.floor(cumulative).astype(np.int64)
@@ -291,6 +372,36 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PERCENTILE,
         help="Absolute-amplitude percentile used for normalization",
     )
+    p.add_argument(
+        "--mode",
+        choices=("adaptive", "classic"),
+        default="adaptive",
+        help="adaptive: pulse density follows loudness (silence = no tiles). "
+        "classic: fixed 50%% density bias (silence = Fs/2 tiles per second)",
+    )
+    p.add_argument(
+        "--max-density",
+        type=float,
+        default=DEFAULT_MAX_DENSITY,
+        help="adaptive: pulse density at full-scale envelope (0-1]",
+    )
+    p.add_argument(
+        "--max-tiles",
+        type=int,
+        help="adaptive: lower the density so the chart has at most ~this many tiles",
+    )
+    p.add_argument(
+        "--env-ms",
+        type=float,
+        default=DEFAULT_ENV_MS,
+        help="adaptive: envelope block length in milliseconds",
+    )
+    p.add_argument(
+        "--gate-db",
+        type=float,
+        default=DEFAULT_GATE_DB,
+        help="adaptive: envelope below this level (dBFS after normalization) emits no tiles",
+    )
     p.add_argument("--silence-name", default="silence.ogg", help="Silent OGG file name")
     p.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     return p.parse_args()
@@ -309,6 +420,12 @@ def main() -> int:
         raise SystemExit("--gain must be positive")
     if not 0 < args.percentile <= 100:
         raise SystemExit("--percentile must be in (0, 100]")
+    if not 0 < args.max_density <= 1:
+        raise SystemExit("--max-density must be in (0, 1]")
+    if args.max_tiles is not None and args.max_tiles <= 0:
+        raise SystemExit("--max-tiles must be positive")
+    if args.env_ms <= 0:
+        raise SystemExit("--env-ms must be positive")
 
     output = args.output or args.input.with_name(args.input.stem + "_sound_chart.adofai")
     if output.suffix.lower() != ".adofai":
@@ -338,8 +455,31 @@ def main() -> int:
         scale = estimate_abs_percentile(pcm, args.percentile)
         print(f"      abs p{args.percentile:g} = {scale:.8g}")
 
-        print("[3/5] Encoding 1-bit PDM pulses...")
-        floors = encode_pdm_hits(pcm, hit_path, scale=scale, gain=args.gain)
+        env = None
+        gate = 10.0 ** (args.gate_db / 20.0)
+        density_scale = 1.0
+        if args.mode == "adaptive":
+            block = max(1, round(args.rate * args.env_ms / 1000.0))
+            env = compute_envelope(pcm, scale=scale, gain=args.gain, block=block)
+            density_scale = args.max_density
+            if args.max_tiles is not None:
+                base = expected_pulses(
+                    pcm, scale=scale, gain=args.gain, env=env, gate=gate
+                )
+                if base * density_scale > args.max_tiles:
+                    density_scale = args.max_tiles / base
+                    print(f"      --max-tiles: density scaled to {density_scale:.4g}")
+
+        print(f"[3/5] Encoding 1-bit PDM pulses ({args.mode})...")
+        floors = encode_pdm_hits(
+            pcm,
+            hit_path,
+            scale=scale,
+            gain=args.gain,
+            env=env,
+            gate=gate,
+            density_scale=density_scale,
+        )
         if floors == 0:
             raise SystemExit("PDM encoder produced no hits")
         del pcm
@@ -371,7 +511,7 @@ def main() -> int:
     print()
     print(f"duration   : {duration:.3f} s")
     print(f"sample rate: {args.rate:,} Hz")
-    print(f"tiles      : {floors:,}")
+    print(f"tiles      : {floors:,} ({floors / duration:,.0f}/s)")
     print(f"SetSpeed   : {actions:,}")
     print(f"max BPM    : {60 * args.rate:,.0f}")
     print(f"chart      : {output}")

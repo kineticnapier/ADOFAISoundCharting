@@ -35,7 +35,7 @@ The route is intentionally a perfectly straight line (`angleData` is all zeroes)
 
 This is effectively using ADOFAI's hitsound system as a very strange 1-bit DAC.
 
-At sufficiently high sample rates, surprisingly recognizable speech, melodies, bass and distorted kick textures can be reconstructed from millions of hitsounds. A 3-minute song at 44.1 kHz typically produces roughly 4 million tiles with the default settings.
+At sufficiently high sample rates, surprisingly recognizable speech, melodies, bass and distorted kick textures can be reconstructed from millions of hitsounds. In `classic` mode a 3-minute song at 44.1 kHz produces roughly 4 million tiles. The default `adaptive` mode scales tile density with loudness and drops silence, and `--max-tiles` caps the total.
 
 ## Requirements
 
@@ -80,6 +80,12 @@ For a larger / higher-rate experiment:
 python sound_chart.py input.ogg -o output_66k.adofai --rate 66000
 ```
 
+To keep the tile count under a limit (e.g. for the vanilla game):
+
+```bash
+python sound_chart.py input.ogg -o small.adofai --max-tiles 500000 --gate-db -45
+```
+
 The program also creates a silent `.ogg` beside the chart. Keep both files in the same folder.
 
 ## Output
@@ -103,15 +109,41 @@ Large inputs can create **hundreds of megabytes of JSON** and millions of tiles/
 
 ## PDM mapping
 
-The current encoder maps normalized audio `x[n]` to pulse density with:
+Audio is first normalized and soft-clipped: `y[n] = tanh(gain * x[n] / scale)`,
+where `scale` is the `--percentile` absolute amplitude.
+
+### `--mode adaptive` (default)
 
 ```text
-d[n] = 0.5 + 0.49 * tanh(gain * x[n])
+e[n] = look-ahead peak envelope of |y|   (e[n] >= |y[n]|)
+d[n] = max_density * (e[n] + y[n]) / 2
 ```
 
-A first-order accumulator then emits the 1-bit pulse stream.
+Pulse density follows loudness, so **silence produces (almost) no tiles** and quiet
+noise produces very few. Loud passages approach `max_density * e` peak density.
+The envelope is the max of neighbouring `--env-ms` blocks, linearly interpolated,
+so `d` never goes negative. Envelope levels below `--gate-db` emit nothing.
 
-Silence is therefore near 50% density. At 44.1 kHz this creates a carrier near 22.05 kHz; increasing the sample rate can move more of the carrier/noise above the audible range.
+`--max-tiles N` lowers the density uniformly so the chart stays at roughly N
+tiles. Fewer tiles means a lower signal-to-noise ratio, but it is the knob for
+making a chart small enough for the vanilla game to open.
+
+### `--mode classic`
+
+```text
+d[n] = 0.5 + 0.49 * y[n]
+```
+
+Silence is 50% density, i.e. a constant `Fs/2` tiles per second regardless of
+content (carrier near 22.05 kHz at 44.1 kHz).
+
+### Comparison (14 s test clip: tone / digital silence / -54 dB noise / tone)
+
+| mode | tiles | tiles in silent 3 s | SNR 40 Hz–5 kHz (ideal impulses) |
+|---|---|---|---|
+| classic | 308,692 | 66,150 | 9.4 dB |
+| adaptive | 136,593 | 199 | 11.8 dB |
+| adaptive `--max-tiles 50000` | 49,999 | – | 4.1 dB |
 
 ## Notes / limitations
 
@@ -124,7 +156,7 @@ Silence is therefore near 50% density. At 44.1 kHz this creates a carrier near 2
 
 ## 日本語メモ
 
-音源を44.1 kHzなどでモノラルPCM化し、1-bit PDMに変換して、`1`になった時刻だけ床を置きます。床はすべて一直線で、床間隔は`SetSpeed`のBPMに変換します。背景音源は無音なので、聞こえる音はADOFAIのヒットサウンドだけです。
+音源を44.1 kHzなどでモノラルPCM化し、1-bit PDMに変換して、`1`になった時刻だけ床を置きます。デフォルトの`adaptive`モードでは音量エンベロープに比例してパルス密度を変えるので、無音・小さいノイズ部分はほぼ床が出ません。`--max-tiles`で総タイル数の上限を指定できます。床はすべて一直線で、床間隔は`SetSpeed`のBPMに変換します。背景音源は無音なので、聞こえる音はADOFAIのヒットサウンドだけです。
 
 要するに：
 
