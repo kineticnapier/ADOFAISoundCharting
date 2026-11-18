@@ -32,11 +32,16 @@ def run_ffmpeg(args: list[str]) -> None:
     subprocess.run(["ffmpeg", "-y", "-v", "error", *args], check=True)
 
 
-def decode_mono_f32(source: Path, raw_path: Path, rate: int, highpass: float = 0.0) -> int:
-    filters = []
+def decode_mono_f32(
+    source: Path, raw_path: Path, rate: int, highpass: float = 0.0, lowpass: float = 0.0
+) -> int:
+    # Each filter is applied twice: two 2-pole stages = 4th order (24 dB/oct).
+    chain = []
     if highpass > 0:
-        # Two 2-pole high-passes = 4th order (24 dB/oct) low cut.
-        filters = ["-af", f"highpass=f={highpass:g},highpass=f={highpass:g}"]
+        chain += [f"highpass=f={highpass:g}"] * 2
+    if lowpass > 0:
+        chain += [f"lowpass=f={lowpass:g}"] * 2
+    filters = ["-af", ",".join(chain)] if chain else []
     run_ffmpeg([
         "-i", str(source),
         "-ac", "1",
@@ -667,6 +672,13 @@ def parse_args() -> argparse.Namespace:
         "are dropped. 0 = off",
     )
     p.add_argument(
+        "--max-freq",
+        type=float,
+        default=20000.0,
+        help="Highest audible frequency. The input is low-passed (4th order) here; "
+        "skipped when >= rate/2 (the resampler already band-limits). 0 = off",
+    )
+    p.add_argument(
         "--path",
         choices=("angle", "straight"),
         default="angle",
@@ -807,9 +819,17 @@ def main() -> int:
         raw_path = tmpdir / "audio.f32le"
         hit_path = tmpdir / "hits.i64"
 
-        hp = f", high-pass {args.min_freq:g} Hz" if args.min_freq > 0 else ""
-        print(f"[1/{steps}] Decoding mono PCM at {args.rate:,} Hz{hp}...")
-        sample_count = decode_mono_f32(args.input, raw_path, args.rate, args.min_freq)
+        band = []
+        if args.min_freq > 0:
+            band.append(f"high-pass {args.min_freq:g} Hz")
+        if 0 < args.max_freq < args.rate / 2:
+            band.append(f"low-pass {args.max_freq:g} Hz")
+        band_text = (", " + ", ".join(band)) if band else ""
+        print(f"[1/{steps}] Decoding mono PCM at {args.rate:,} Hz{band_text}...")
+        lowpass = args.max_freq if 0 < args.max_freq < args.rate / 2 else 0.0
+        sample_count = decode_mono_f32(
+            args.input, raw_path, args.rate, args.min_freq, lowpass
+        )
         if sample_count == 0:
             raise SystemExit("Decoded audio is empty")
         duration = sample_count / args.rate
