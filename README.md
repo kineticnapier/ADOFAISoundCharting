@@ -253,6 +253,14 @@ content (carrier near 22.05 kHz at 44.1 kHz).
 | adaptive | 136,593 | 199 | 11.8 dB |
 | adaptive `--max-tiles 50000` | 49,999 | – | 4.1 dB |
 
+## Isolated pulses (`--min-freq`, default 20 Hz)
+
+The audible range is roughly 20 Hz–20 kHz. A pulse more than `1/min-freq` s
+(50 ms at 20 Hz) away from **both** neighbours is heard as a lone click rather
+than part of a tone, so it is dropped. With the default adaptive mode and
+`--gate-db -60` such pulses are rare (only just above the gate). Long gaps that
+span real silence are kept: they carry the silence's duration.
+
 ## Notes / limitations
 
 - This is experimental, not a normal charting workflow.

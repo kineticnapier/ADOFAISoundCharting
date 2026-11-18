@@ -176,6 +176,32 @@ def encode_pdm_hits(
     return total_hits
 
 
+def drop_isolated_hits(
+    hit_path: Path, vol_path: Path | None, count: int, max_gap: int
+) -> int:
+    """Remove hits that are more than max_gap samples away from both neighbours.
+
+    Such a pulse repeats slower than the lowest audible frequency, so it is
+    heard as a lone click instead of part of a tone. Rewrites the files in
+    place and returns the new hit count.
+    """
+    if count == 0:
+        return 0
+    hits = np.fromfile(hit_path, dtype="<i8", count=count)
+    before = np.empty(count, dtype=np.int64)
+    after = np.empty(count, dtype=np.int64)
+    before[0] = hits[0] + 1  # time 0 counts as the previous neighbour
+    before[1:] = np.diff(hits)
+    after[:-1] = before[1:]
+    after[-1] = max_gap + 1
+    keep = ~((before > max_gap) & (after > max_gap))
+    hits[keep].tofile(hit_path)
+    if vol_path is not None:
+        vols = np.fromfile(vol_path, dtype="<i2", count=count)
+        vols[keep].tofile(vol_path)
+    return int(keep.sum())
+
+
 def bpm_for_gap_f(rate: int, gap: float) -> float:
     return 60.0 * rate / gap
 
@@ -628,6 +654,13 @@ def parse_args() -> argparse.Namespace:
         "handles PlaySound)",
     )
     p.add_argument(
+        "--min-freq",
+        type=float,
+        default=20.0,
+        help="pdm/tiles: drop pulses farther than 1/min-freq seconds from both "
+        "neighbours (isolated sub-audio clicks). 0 = keep all",
+    )
+    p.add_argument(
         "--path",
         choices=("angle", "straight"),
         default="angle",
@@ -882,6 +915,16 @@ def main() -> int:
         if floors == 0:
             raise SystemExit("PDM encoder produced no hits")
         del pcm
+
+        if args.min_freq > 0 and floors:
+            max_gap = int(args.rate / args.min_freq)
+            kept = drop_isolated_hits(hit_path, vol_path, floors, max_gap)
+            if kept < floors:
+                print(f"      dropped {floors - kept:,} isolated pulses "
+                      f"(> {max_gap:,} samples from both neighbours, < {args.min_freq:g} Hz)")
+            floors = kept
+            if floors == 0:
+                raise SystemExit("No pulses left after --min-freq filtering")
 
         hits = np.memmap(hit_path, dtype="<i8", mode="r", shape=(floors,))
         volumes = (
