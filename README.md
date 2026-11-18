@@ -77,13 +77,13 @@ python sound_chart.py input.mp3 \
 For a larger / higher-rate experiment:
 
 ```bash
-python sound_chart.py input.ogg -o output_66k.adofai --rate 66000
+python sound_chart.py input.ogg -o output_66k.adofai --engine pdm --rate 66000
 ```
 
 To keep the tile count under a limit (e.g. for the vanilla game):
 
 ```bash
-python sound_chart.py input.ogg -o small.adofai --max-tiles 500000 --gate-db -45
+python sound_chart.py input.ogg -o small.adofai --engine pdm --max-tiles 500000 --gate-db -45
 ```
 
 The program also creates a silent `.ogg` beside the chart. Keep both files in the same folder.
@@ -106,6 +106,51 @@ The generated level contains:
 - a silent background OGG
 
 Large inputs can create **hundreds of megabytes of JSON** and millions of tiles/events. Loading the result may stress both ADOFAI and third-party editors.
+
+## Engines
+
+### `--engine playsound` (default)
+
+Tile count is what makes vanilla ADOFAI choke, so this engine uses **very few
+tiles** and carries the audio in `PlaySound` events instead:
+
+```text
+Audio -> mono PCM at --rate (default 11025 Hz)
+      -> normalize / soft-clip / envelope bias (silence = 0)
+      -> multi-level noise-shaped quantization to volume 0..--volume-max
+      -> one PlaySound event per non-zero sample
+         floor       = 1 + n // tile_len
+         angleOffset = 180 * (n % tile_len) / tile_len
+```
+
+- Tiles are straight, constant BPM, `--tile-ms` long (default 100 ms → 10 tiles/s,
+  ~1,800 tiles for a 3-minute song). No `SetSpeed` events.
+- Each event carries its own `hitsoundVolume`, so one event is a multi-level
+  sample instead of a 1-bit pulse. That needs far fewer events than PDM for the
+  same quality.
+- The global tile hitsound volume is set to 0; only PlaySound is audible.
+- Events/s ≈ `--rate` during loud passages; silence emits nothing.
+- `--rate` sets the bandwidth (≈ rate/2). Below ~8 kHz the sample-rate images
+  fall inside the audible band.
+
+30 s test clip (simulated with ideal impulses, 40 Hz–5 kHz):
+
+| --rate | tiles | events | size | SNR |
+|---|---|---|---|---|
+| 8000 | 302 | 238,108 | 24 MB | 12.9 dB |
+| 11025 | 303 | 328,750 | 34 MB | 18.4 dB |
+| 22050 | 302 | 658,093 | 68 MB | 18.6 dB |
+| (pdm, 300k tiles) | 300,001 | 211,047 SetSpeed | 25 MB | 6.3 dB |
+
+A 3-minute song at 11025 Hz is roughly 2M events / 200 MB of JSON; at 8000 Hz
+roughly 1.4M events / 145 MB. Lower `--rate` or cut the song if parsing is too slow.
+
+> The PlaySound JSON (`hitsound`, `hitsoundVolume`, `angleOffset`) has not been
+> verified against an editor-saved file yet.
+
+### `--engine pdm`
+
+One tile per 1-bit pulse; timing encoded with `SetSpeed`. See below.
 
 ## PDM mapping
 
@@ -156,7 +201,7 @@ content (carrier near 22.05 kHz at 44.1 kHz).
 
 ## 日本語メモ
 
-音源を44.1 kHzなどでモノラルPCM化し、1-bit PDMに変換して、`1`になった時刻だけ床を置きます。デフォルトの`adaptive`モードでは音量エンベロープに比例してパルス密度を変えるので、無音・小さいノイズ部分はほぼ床が出ません。`--max-tiles`で総タイル数の上限を指定できます。床はすべて一直線で、床間隔は`SetSpeed`のBPMに変換します。背景音源は無音なので、聞こえる音はADOFAIのヒットサウンドだけです。
+音源を44.1 kHzなどでモノラルPCM化し、1-bit PDMに変換して、`1`になった時刻だけ床を置きます。デフォルトの`--engine playsound`では床は10枚/秒程度だけ置き、音は「サウンド再生」イベント（角度オフセット＋音量）で鳴らします。`--engine pdm`の`adaptive`モードでは音量エンベロープに比例してパルス密度を変えるので、無音・小さいノイズ部分はほぼ床が出ません。`--max-tiles`で総タイル数の上限を指定できます。床はすべて一直線で、床間隔は`SetSpeed`のBPMに変換します。背景音源は無音なので、聞こえる音はADOFAIのヒットサウンドだけです。
 
 要するに：
 

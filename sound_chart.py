@@ -11,7 +11,10 @@ from pathlib import Path
 import numpy as np
 
 
-DEFAULT_RATE = 44_100
+DEFAULT_PDM_RATE = 44_100
+DEFAULT_PLAYSOUND_RATE = 11_025
+DEFAULT_TILE_MS = 100.0
+DEFAULT_VOLUME_MAX = 100
 DEFAULT_GAIN = 1.35
 DEFAULT_PERCENTILE = 99.5
 DENSITY_CENTER = 0.5
@@ -186,6 +189,8 @@ def make_settings(
     rate: int,
     floors: int,
     initial_bpm: float,
+    hitsound_volume: int = 100,
+    description: str | None = None,
 ) -> dict:
     return {
         "version": 15,
@@ -201,7 +206,7 @@ def make_settings(
         "previewSongStart": 0,
         "previewSongDuration": 10,
         "seizureWarning": "Disabled",
-        "levelDesc": (
+        "levelDesc": description or (
             f"{rate} Hz 1-bit PDM Sound Charting reconstruction, "
             f"{floors:,} straight tiles. Background audio is silent."
         ),
@@ -216,7 +221,7 @@ def make_settings(
         "offset": 0,
         "pitch": 100,
         "hitsound": hitsound,
-        "hitsoundVolume": 100,
+        "hitsoundVolume": hitsound_volume,
         "countdownTicks": 0,
         "trackColorType": "Single",
         "trackColor": "debb7b",
@@ -344,6 +349,89 @@ def write_chart(
     return actions
 
 
+def write_playsound_chart(
+    output: Path,
+    pcm: np.memmap,
+    settings: dict,
+    *,
+    tiles: int,
+    tile_len: int,
+    start_floor: int,
+    hitsound: str,
+    volume_max: int,
+    scale: float,
+    gain: float,
+    env: "Envelope | None",
+    gate: float,
+) -> tuple[int, int]:
+    """Few straight tiles at a constant BPM; the audio is PlaySound events.
+
+    Every sample n is a potential PlaySound at time n/rate. Its volume is a
+    multi-level, first-order noise-shaped quantization of the target amplitude
+    (0..volume_max). Zero-volume samples emit no event, so silence is free.
+
+    Sample n lives on floor start_floor + n // tile_len with
+    angleOffset = 180 * (n % tile_len) / tile_len (straight tile = 180 deg = 1 beat).
+    """
+    events = 0
+    volume_sum = 0
+    acc = 0.0
+    prev_level = 0
+    first = True
+    head = (
+        '{"floor":%d,"eventType":"PlaySound","hitsound":'
+        + json.dumps(hitsound)
+        + ',"hitsoundVolume":%d,"angleOffset":%.7g}'
+    )
+    deg_per_sample = 180.0 / tile_len
+
+    with output.open("w", encoding="utf-8", buffering=1024 * 1024) as f:
+        f.write('{"angleData":[')
+        write_zero_angles(f, tiles)
+        f.write('],"settings":')
+        f.write(json.dumps(settings, ensure_ascii=False, separators=(",", ":")))
+        f.write(',"actions":[')
+
+        for start in range(0, len(pcm), PCM_CHUNK_SAMPLES):
+            end = min(start + PCM_CHUNK_SAMPLES, len(pcm))
+            target = base_density(
+                pcm, start, end, scale=scale, gain=gain, env=env, gate=gate
+            ) * volume_max
+            cumulative = acc + np.cumsum(target, dtype=np.float64)
+            levels = np.floor(cumulative + 0.5).astype(np.int64)
+            volume = np.diff(levels, prepend=prev_level)
+            shift = math.floor(cumulative[-1])
+            acc = float(cumulative[-1] - shift)
+            prev_level = int(levels[-1] - shift)
+
+            idx = np.flatnonzero(volume > 0)
+            if not len(idx):
+                continue
+            n = idx + start
+            floors = start_floor + n // tile_len
+            offsets = (n % tile_len) * deg_per_sample
+            vols = volume[idx]
+            volume_sum += int(vols.sum())
+
+            for c in range(0, len(idx), ACTION_CHUNK):
+                part = ",".join(
+                    head % (fl, v, off)
+                    for fl, v, off in zip(
+                        floors[c:c + ACTION_CHUNK].tolist(),
+                        vols[c:c + ACTION_CHUNK].tolist(),
+                        offsets[c:c + ACTION_CHUNK].tolist(),
+                    )
+                )
+                if not first:
+                    f.write(",")
+                f.write(part)
+                first = False
+            events += len(idx)
+
+        f.write('],"decorations":[]}')
+    return events, volume_sum
+
+
 def create_silence(path: Path, duration: float) -> None:
     run_ffmpeg([
         "-f", "lavfi",
@@ -361,7 +449,31 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("input", type=Path, help="Input audio file understood by FFmpeg")
     p.add_argument("-o", "--output", type=Path, help="Output .adofai path")
-    p.add_argument("--rate", type=int, default=DEFAULT_RATE, help="PCM/PDM sample rate")
+    p.add_argument(
+        "--engine",
+        choices=("playsound", "pdm"),
+        default="playsound",
+        help="playsound: few tiles, audio carried by PlaySound events with angleOffset "
+        "and per-event volume. pdm: one tile per 1-bit pulse (huge tile counts)",
+    )
+    p.add_argument(
+        "--rate",
+        type=int,
+        help=f"Sample rate (default {DEFAULT_PLAYSOUND_RATE} for playsound, "
+        f"{DEFAULT_PDM_RATE} for pdm). For playsound this is the max events/s",
+    )
+    p.add_argument(
+        "--tile-ms",
+        type=float,
+        default=DEFAULT_TILE_MS,
+        help="playsound: duration of one straight tile in milliseconds",
+    )
+    p.add_argument(
+        "--volume-max",
+        type=int,
+        default=DEFAULT_VOLUME_MAX,
+        help="playsound: PlaySound volume used for full-scale amplitude",
+    )
     p.add_argument("--hitsound", default="Sidestick", help="ADOFAI hitsound name")
     p.add_argument("--title", help="ADOFAI song title")
     p.add_argument("--artist", help="ADOFAI artist field")
@@ -409,6 +521,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.rate is None:
+        args.rate = DEFAULT_PLAYSOUND_RATE if args.engine == "playsound" else DEFAULT_PDM_RATE
 
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg was not found on PATH")
@@ -426,6 +540,10 @@ def main() -> int:
         raise SystemExit("--max-tiles must be positive")
     if args.env_ms <= 0:
         raise SystemExit("--env-ms must be positive")
+    if args.tile_ms <= 0:
+        raise SystemExit("--tile-ms must be positive")
+    if args.volume_max <= 0:
+        raise SystemExit("--volume-max must be positive")
 
     output = args.output or args.input.with_name(args.input.stem + "_sound_chart.adofai")
     if output.suffix.lower() != ".adofai":
@@ -457,6 +575,62 @@ def main() -> int:
 
         env = None
         gate = 10.0 ** (args.gate_db / 20.0)
+
+        if args.engine == "playsound":
+            if args.mode == "adaptive":
+                block = max(1, round(args.rate * args.env_ms / 1000.0))
+                env = compute_envelope(pcm, scale=scale, gain=args.gain, block=block)
+            tile_len = max(1, round(args.rate * args.tile_ms / 1000.0))
+            start_floor = 1
+            tiles = start_floor + -(-sample_count // tile_len) + 1
+            bpm = 60.0 * args.rate / tile_len
+            title = args.title or f"{args.input.stem} [Sound Charting]"
+            artist = args.artist or args.input.stem
+            settings = make_settings(
+                source=args.input,
+                title=title,
+                artist=artist,
+                hitsound=args.hitsound,
+                silence_name=silence.name,
+                rate=args.rate,
+                floors=tiles,
+                initial_bpm=bpm,
+                hitsound_volume=0,
+                description=(
+                    f"{args.rate} Hz PlaySound Sound Charting reconstruction, "
+                    f"{tiles:,} straight tiles. Background audio is silent."
+                ),
+            )
+            print(f"[3/4] Writing {tiles:,} tiles + PlaySound events ({args.mode})...")
+            events, volume_sum = write_playsound_chart(
+                output,
+                pcm,
+                settings,
+                tiles=tiles,
+                tile_len=tile_len,
+                start_floor=start_floor,
+                hitsound=args.hitsound,
+                volume_max=args.volume_max,
+                scale=scale,
+                gain=args.gain,
+                env=env,
+                gate=gate,
+            )
+            del pcm
+            print("[4/4] Creating silent background OGG...")
+            create_silence(silence, duration + args.tile_ms / 1000.0 * (start_floor + 1))
+            size = output.stat().st_size
+            print()
+            print(f"duration   : {duration:.3f} s")
+            print(f"sample rate: {args.rate:,} Hz")
+            print(f"tiles      : {tiles:,} (BPM {bpm:.10g})")
+            print(f"PlaySound  : {events:,} ({events / duration:,.0f}/s, "
+                  f"avg volume {volume_sum / max(events, 1):.1f})")
+            print(f"file size  : {size / 1e6:,.1f} MB")
+            print(f"chart      : {output}")
+            print(f"silence    : {silence}")
+            return 0
+
         density_scale = 1.0
         if args.mode == "adaptive":
             block = max(1, round(args.rate * args.env_ms / 1000.0))
