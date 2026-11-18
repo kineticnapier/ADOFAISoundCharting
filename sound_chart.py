@@ -511,6 +511,27 @@ def write_playsound_chart(
     return events, volume_sum
 
 
+def install_silence(path: Path, duration: float, tmpdir: Path) -> None:
+    """Render the silent OGG in tmpdir, then copy it over the target.
+
+    The target is often still open in ADOFAI / an editor (it is the chart's
+    song file), which locks it on Windows. That must not throw away a chart
+    that took minutes to write, so a locked target only produces a warning.
+    """
+    tmp = tmpdir / "silence.ogg"
+    create_silence(tmp, duration)
+    try:
+        shutil.copyfile(tmp, path)
+    except PermissionError:
+        print()
+        print(f"WARNING: could not write {path} (it is probably open in ADOFAI or an editor).")
+        if path.exists():
+            print("         Keeping the existing file; it may be shorter than this chart.")
+        else:
+            print("         The chart has no song file yet.")
+        print("         Close the program and run again, or use a different -o name.")
+
+
 def create_silence(path: Path, duration: float) -> None:
     run_ffmpeg([
         "-f", "lavfi",
@@ -728,7 +749,7 @@ def main() -> int:
             )
             del pcm
             print("[4/4] Creating silent background OGG...")
-            create_silence(silence, duration + args.tile_ms / 1000.0 * (start_floor + 1))
+            install_silence(silence, duration + args.tile_ms / 1000.0 * (start_floor + 1), tmpdir)
             size = output.stat().st_size
             print()
             print(f"duration   : {duration:.3f} s")
@@ -820,7 +841,7 @@ def main() -> int:
         del hits, volumes
 
         print("[5/5] Creating silent background OGG...")
-        create_silence(silence, duration)
+        install_silence(silence, duration, tmpdir)
 
     print()
     print(f"duration   : {duration:.3f} s")
