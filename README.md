@@ -109,7 +109,38 @@ Large inputs can create **hundreds of megabytes of JSON** and millions of tiles/
 
 ## Engines
 
-### `--engine playsound` (default)
+### `--engine tiles` (default)
+
+One straight tile per non-zero sample; the hit **volume** carries the amplitude.
+
+```text
+Audio -> mono PCM at --rate (default 11025 Hz)
+      -> normalize / soft-clip / envelope bias (silence = 0)
+      -> multi-level noise-shaped quantization to volume 0..--volume-max
+      -> one tile per non-zero sample
+         SetSpeed    on floor j: gap to the next hit   (only when it changes)
+         SetHitsound on floor j: volume of the hit on j (only when it changes)
+```
+
+Event semantics were checked against the game code: a floor's speed governs the
+travel *from* that floor to the next (`scrLevelMaker.CalculateFloorEntryTimes`),
+and a `SetHitsound` on floor j sets the volume of the hit on floor j
+(`scrConductor.PlayHitTimes`). Tile hitsounds are what renderers such as
+HzHitSoundRenderer capture (`scrConductor.hitSoundsData`).
+
+10 s clip, simulated with the game's timing rules (40 Hz–5 kHz):
+
+| engine | --rate | tiles | events | size | SNR |
+|---|---|---|---|---|---|
+| tiles | 6000 | 59,569 | 57.5k | 6.3 MB | 10.5 dB |
+| tiles | 8000 | 79,468 | 75.5k | 8.3 MB | 17.4 dB |
+| tiles | 11025 | 109,565 | 101.6k | 11.2 MB | 18.2 dB |
+| pdm `--max-tiles 80000` | 44100 | 80,000 | 48.8k | 5.8 MB | 3.9 dB |
+
+Tile count ≈ `--rate` × seconds of non-silent audio, so for a ~100k-tile budget
+use about 8 kHz for 10 s.
+
+### `--engine playsound`
 
 Tile count is what makes vanilla ADOFAI choke, so this engine uses **very few
 tiles** and carries the audio in `PlaySound` events instead:
@@ -129,6 +160,8 @@ Audio -> mono PCM at --rate (default 11025 Hz)
   sample instead of a 1-bit pulse. That needs far fewer events than PDM for the
   same quality.
 - The global tile hitsound volume is set to 0; only PlaySound is audible.
+- Needs a hitsound renderer that also captures PlaySound; HzHitSoundRenderer
+  currently only renders tile hitsounds.
 - Every hit (tile or PlaySound) is a separate Unity `AudioSource.PlayScheduled`;
   the game does not pre-mix hitsounds. With full-length clips thousands of
   voices overlap and most get culled. `--play-duration` (default 1 ms) sets

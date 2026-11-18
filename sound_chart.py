@@ -276,59 +276,77 @@ def write_zero_angles(f, count: int) -> None:
         f.write(",".join(["0"] * rem))
 
 
-def write_actions(f, hits: np.memmap, rate: int) -> int:
-    """Write SetSpeed events only where pulse spacing changes."""
-    if len(hits) < 2:
-        return 0
+def write_actions(
+    f,
+    hits: np.memmap,
+    rate: int,
+    *,
+    volumes: np.memmap | None = None,
+    hitsound: str = "Sidestick",
+) -> tuple[int, int]:
+    """Write SetSpeed (and optionally SetHitsound) events for a hit timeline.
 
-    event_count = 0
-    first_action = True
-    previous_gap: int | None = None
-    previous_hit = int(hits[0])
+    Floor j (j >= 1) is the hit at sample hits[j-1]. In ADOFAI the speed of
+    floor j governs the travel floor j -> j+1 (scrLevelMaker
+    .CalculateFloorEntryTimes), so the gap hits[j] - hits[j-1] goes on floor j.
+    A SetHitsound on floor j sets the volume of the hit *on* floor j
+    (scrConductor.PlayHitTimes), so volumes[j-1] goes on floor j.
+    Events are only written where the value changes.
+    """
+    n = len(hits)
+    speed_count = 0
+    volume_count = 0
+    first = True
+    prev_gap = -1
+    prev_vol = int(volumes[0]) if volumes is not None and n else -1
+    speed_fmt = (
+        '{"floor":%d,"eventType":"SetSpeed","speedType":"Bpm",'
+        '"beatsPerMinute":%.12g,"bpmMultiplier":1,"angleOffset":0}'
+    )
+    vol_fmt = (
+        '{"floor":%d,"eventType":"SetHitsound","gameSound":"Hitsound","hitsound":'
+        + json.dumps(hitsound)
+        + ',"hitsoundVolume":%d}'
+    )
 
-    # Chunked scan keeps the temporary arrays bounded.
-    for start in range(1, len(hits), PCM_CHUNK_SAMPLES):
-        end = min(start + PCM_CHUNK_SAMPLES, len(hits))
-        current = np.asarray(hits[start:end], dtype=np.int64)
-        if len(current) == 0:
-            continue
+    for start in range(0, n, PCM_CHUNK_SAMPLES):
+        end = min(start + PCM_CHUNK_SAMPLES, n)
+        floors = np.arange(start + 1, end + 1, dtype=np.int64)  # floor of each hit
 
-        with_prev = np.empty(len(current) + 1, dtype=np.int64)
-        with_prev[0] = previous_hit
-        with_prev[1:] = current
-        gaps = np.diff(with_prev)
+        # Speed for floor j (travel to j+1): hits[j] - hits[j-1], for j < n.
+        h = np.asarray(hits[start:min(end + 1, n)], dtype=np.int64)
+        gaps = np.diff(h)  # gaps[i] belongs to floor start+1+i
+        g_prev = np.concatenate([[prev_gap], gaps[:-1]]) if len(gaps) else gaps
+        sp_idx = np.flatnonzero(gaps != g_prev)
+        if len(gaps):
+            prev_gap = int(gaps[-1])
 
-        changed = np.empty(len(gaps), dtype=bool)
-        changed[0] = previous_gap is None or int(gaps[0]) != previous_gap
-        if len(gaps) > 1:
-            changed[1:] = gaps[1:] != gaps[:-1]
+        if volumes is not None:
+            v = np.asarray(volumes[start:end], dtype=np.int64)
+            v_prev = np.concatenate([[prev_vol], v[:-1]])
+            vo_idx = np.flatnonzero(v != v_prev)
+            prev_vol = int(v[-1])
+        else:
+            vo_idx = np.empty(0, dtype=np.int64)
 
-        indices = np.flatnonzero(changed)
-        for chunk_start in range(0, len(indices), ACTION_CHUNK):
-            idx = indices[chunk_start:chunk_start + ACTION_CHUNK]
-            parts: list[str] = []
-            for local_i in idx:
-                # hits[start + local_i] is the pulse reached by this gap.
-                # This matches the experimental chart format used by this tool.
-                floor = start + int(local_i) + 1
-                gap = int(gaps[local_i])
-                parts.append(
-                    '{"floor":%d,"eventType":"SetSpeed","speedType":"Bpm",'
-                    '"beatsPerMinute":%.12g,"bpmMultiplier":1,"angleOffset":0}'
-                    % (floor, bpm_for_gap(rate, gap))
-                )
+        for c0 in range(0, len(floors), ACTION_CHUNK):
+            c1 = c0 + ACTION_CHUNK
+            sp = sp_idx[(sp_idx >= c0) & (sp_idx < c1)]
+            vo = vo_idx[(vo_idx >= c0) & (vo_idx < c1)]
+            items = [(int(i), 0, speed_fmt % (floors[i], 60.0 * rate / int(gaps[i])))
+                     for i in sp.tolist()]
+            items += [(int(i), 1, vol_fmt % (floors[i], int(v[i]))) for i in vo.tolist()]
+            if not items:
+                continue
+            items.sort()
+            if not first:
+                f.write(",")
+            f.write(",".join(t for _, _, t in items))
+            first = False
+            speed_count += len(sp)
+            volume_count += len(vo)
 
-            if parts:
-                if not first_action:
-                    f.write(",")
-                f.write(",".join(parts))
-                first_action = False
-                event_count += len(parts)
-
-        previous_gap = int(gaps[-1])
-        previous_hit = int(current[-1])
-
-    return event_count
+    return speed_count, volume_count
 
 
 def write_chart(
@@ -336,17 +354,60 @@ def write_chart(
     hits: np.memmap,
     settings: dict,
     rate: int,
-) -> int:
+    *,
+    volumes: np.memmap | None = None,
+    hitsound: str = "Sidestick",
+) -> tuple[int, int]:
     floors = len(hits)
     with output.open("w", encoding="utf-8", buffering=1024 * 1024) as f:
         f.write('{"angleData":[')
-        write_zero_angles(f, floors + 1)
+        write_zero_angles(f, floors)  # floor 0 + one floor per hit
         f.write('],"settings":')
         f.write(json.dumps(settings, ensure_ascii=False, separators=(",", ":")))
         f.write(',"actions":[')
-        actions = write_actions(f, hits, rate)
+        counts = write_actions(f, hits, rate, volumes=volumes, hitsound=hitsound)
         f.write('],"decorations":[]}')
-    return actions
+    return counts
+
+
+def encode_multilevel_hits(
+    pcm: np.memmap,
+    hit_path: Path,
+    vol_path: Path,
+    *,
+    volume_max: int,
+    scale: float,
+    gain: float,
+    env: "Envelope | None",
+    gate: float,
+) -> int:
+    """Multi-level first-order noise-shaped quantization to integer volumes.
+
+    Writes the sample index (int64) and volume (int16) of every non-zero
+    sample. Silence (volume 0) produces no hit.
+    """
+    total = 0
+    acc = 0.0
+    prev_level = 0
+    with hit_path.open("wb") as hout, vol_path.open("wb") as vout:
+        for start in range(0, len(pcm), PCM_CHUNK_SAMPLES):
+            end = min(start + PCM_CHUNK_SAMPLES, len(pcm))
+            target = base_density(
+                pcm, start, end, scale=scale, gain=gain, env=env, gate=gate
+            ) * volume_max
+            cumulative = acc + np.cumsum(target, dtype=np.float64)
+            levels = np.floor(cumulative + 0.5).astype(np.int64)
+            volume = np.diff(levels, prepend=prev_level)
+            shift = math.floor(cumulative[-1])
+            acc = float(cumulative[-1] - shift)
+            prev_level = int(levels[-1] - shift)
+
+            idx = np.flatnonzero(volume > 0)
+            if len(idx):
+                (idx + start).astype("<i8").tofile(hout)
+                volume[idx].astype("<i2").tofile(vout)
+                total += len(idx)
+    return total
 
 
 def write_playsound_chart(
@@ -468,10 +529,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-o", "--output", type=Path, help="Output .adofai path")
     p.add_argument(
         "--engine",
-        choices=("playsound", "pdm"),
-        default="playsound",
-        help="playsound: few tiles, audio carried by PlaySound events with angleOffset "
-        "and per-event volume. pdm: one tile per 1-bit pulse (huge tile counts)",
+        choices=("tiles", "playsound", "pdm"),
+        default="tiles",
+        help="tiles: one tile per sample, volume via SetHitsound (multi-level). "
+        "playsound: few tiles, audio in PlaySound events (needs a renderer that "
+        "handles PlaySound). pdm: one tile per 1-bit pulse",
     )
     p.add_argument(
         "--rate",
@@ -555,7 +617,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.rate is None:
-        args.rate = DEFAULT_PLAYSOUND_RATE if args.engine == "playsound" else DEFAULT_PDM_RATE
+        args.rate = DEFAULT_PDM_RATE if args.engine == "pdm" else DEFAULT_PLAYSOUND_RATE
 
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg was not found on PATH")
@@ -571,6 +633,9 @@ def main() -> int:
         raise SystemExit("--max-density must be in (0, 1]")
     if args.max_tiles is not None and args.max_tiles <= 0:
         raise SystemExit("--max-tiles must be positive")
+    if args.max_tiles is not None and args.engine != "pdm":
+        raise SystemExit("--max-tiles only applies to --engine pdm "
+                         "(for tiles, lower --rate or shorten the clip)")
     if args.env_ms <= 0:
         raise SystemExit("--env-ms must be positive")
     if args.tile_ms <= 0:
@@ -595,6 +660,7 @@ def main() -> int:
             raise SystemExit(f"Output already exists: {names} (use --force to overwrite)")
 
     steps = 4 if args.engine == "playsound" else 5
+    vol_path = None
 
     with tempfile.TemporaryDirectory(prefix="adofai_sound_chart_") as tmp:
         tmpdir = Path(tmp)
@@ -680,7 +746,7 @@ def main() -> int:
             block = max(1, round(args.rate * args.env_ms / 1000.0))
             env = compute_envelope(pcm, scale=scale, gain=args.gain, block=block)
             density_scale = args.max_density
-            if args.max_tiles is not None:
+            if args.max_tiles is not None and args.engine == "pdm":
                 base = expected_pulses(
                     pcm, scale=scale, gain=args.gain, env=env, gate=gate
                 )
@@ -688,23 +754,42 @@ def main() -> int:
                     density_scale = args.max_tiles / base
                     print(f"      --max-tiles: density scaled to {density_scale:.4g}")
 
-        print(f"[3/5] Encoding 1-bit PDM pulses ({args.mode})...")
-        floors = encode_pdm_hits(
-            pcm,
-            hit_path,
-            scale=scale,
-            gain=args.gain,
-            env=env,
-            gate=gate,
-            density_scale=density_scale,
-        )
+        if args.engine == "tiles":
+            vol_path = tmpdir / "vols.i16"
+            print(f"[3/5] Encoding multi-level hits ({args.mode})...")
+            floors = encode_multilevel_hits(
+                pcm,
+                hit_path,
+                vol_path,
+                volume_max=args.volume_max,
+                scale=scale,
+                gain=args.gain,
+                env=env,
+                gate=gate,
+            )
+        else:
+            print(f"[3/5] Encoding 1-bit PDM pulses ({args.mode})...")
+            floors = encode_pdm_hits(
+                pcm,
+                hit_path,
+                scale=scale,
+                gain=args.gain,
+                env=env,
+                gate=gate,
+                density_scale=density_scale,
+            )
         if floors == 0:
             raise SystemExit("PDM encoder produced no hits")
         del pcm
 
         hits = np.memmap(hit_path, dtype="<i8", mode="r", shape=(floors,))
+        volumes = (
+            np.memmap(vol_path, dtype="<i2", mode="r", shape=(floors,))
+            if vol_path is not None else None
+        )
         initial_gap = max(1, int(hits[0]))
         initial_bpm = bpm_for_gap(args.rate, initial_gap)
+        first_volume = int(volumes[0]) if volumes is not None else 100
 
         title = args.title or f"{args.input.stem} [Sound Charting]"
         artist = args.artist or args.input.stem
@@ -717,11 +802,19 @@ def main() -> int:
             rate=args.rate,
             floors=floors,
             initial_bpm=initial_bpm,
+            hitsound_volume=first_volume,
+            description=(
+                f"{args.rate} Hz {'multi-level SetHitsound' if volumes is not None else '1-bit PDM'} "
+                f"Sound Charting reconstruction, {floors:,} straight tiles. "
+                "Background audio is silent."
+            ),
         )
 
         print(f"[4/5] Writing {floors:,} straight tiles...")
-        actions = write_chart(output, hits, settings, args.rate)
-        del hits
+        speed_events, volume_events = write_chart(
+            output, hits, settings, args.rate, volumes=volumes, hitsound=args.hitsound
+        )
+        del hits, volumes
 
         print("[5/5] Creating silent background OGG...")
         create_silence(silence, duration)
@@ -730,7 +823,10 @@ def main() -> int:
     print(f"duration   : {duration:.3f} s")
     print(f"sample rate: {args.rate:,} Hz")
     print(f"tiles      : {floors:,} ({floors / duration:,.0f}/s)")
-    print(f"SetSpeed   : {actions:,}")
+    print(f"SetSpeed   : {speed_events:,}")
+    if args.engine == "tiles":
+        print(f"SetHitsound: {volume_events:,}")
+    print(f"file size  : {output.stat().st_size / 1e6:,.1f} MB")
     print(f"max BPM    : {60 * args.rate:,.0f}")
     print(f"chart      : {output}")
     print(f"silence    : {silence}")
