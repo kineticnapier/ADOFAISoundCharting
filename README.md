@@ -122,6 +122,10 @@ Turn on floor j follows the game code: `mod(a[j-1] − a[j] − 180, 360)`
 10 s clip, 100k tiles: straight 65,402 SetSpeed / 7.7 MB → angle 37,491 SetSpeed /
 5.4 MB, same timing (simulated SNR 6.5 → 6.8 dB).
 
+`--base-angle` (default 180) sets how many degrees an average gap turns; the
+base BPM follows so timing is unchanged. 180 = average gap goes straight; 100–120
+curls into small loops/polygons; 210–240 curls the other way.
+
 **Steering** (`--steer-depth`, default 4): floors at 90–135° can also be played
 at 180–270° with double speed (and vice versa), same timing. At each such floor
 all 2^depth combinations of the next `depth` choice floors are simulated (the

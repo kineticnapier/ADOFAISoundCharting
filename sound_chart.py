@@ -321,14 +321,16 @@ ANGLE_MIN = 90.0
 ANGLE_MAX = 270.0
 
 
-def angle_path(gaps: np.ndarray, base_gap: float) -> tuple[np.ndarray, np.ndarray]:
+def angle_path(
+    gaps: np.ndarray, base_gap: float, base_angle: float = 180.0
+) -> tuple[np.ndarray, np.ndarray]:
     """Turn angle (deg) and speed multiplier for each gap at the base BPM.
 
     At the base BPM a gap of g samples is 180 * g / base_gap degrees.
     While the angle is < 90 the speed and the angle are doubled; while it is
     > 270 both are halved. Travel time = angle/180 * 60/(bpm*mult) is unchanged.
     """
-    theta = 180.0 * gaps.astype(np.float64) / base_gap
+    theta = base_angle * gaps.astype(np.float64) / base_gap
     mult = np.ones_like(theta)
     small = theta < ANGLE_MIN
     if small.any():
@@ -836,6 +838,14 @@ def parse_args() -> argparse.Namespace:
         "combinations per step. 0 = off",
     )
     p.add_argument(
+        "--base-angle",
+        type=float,
+        default=180.0,
+        help="angle path: turn angle (deg) of an average-length gap at the base BPM. "
+        "180 = average gap goes straight; e.g. 120 curls into loops, 240 curls the "
+        "other way. Timing is unchanged",
+    )
+    p.add_argument(
         "--steer-spread",
         type=float,
         default=0.0,
@@ -1119,9 +1129,12 @@ def main() -> int:
         base_gap = None
         theta = mult = None
         if args.path == "angle":
-            base_gap = (
+            avg_gap = (
                 (int(hits[-1]) - int(hits[0])) / (floors - 1) if floors > 1 else float(initial_gap)
             )
+            # An average gap turns base_angle degrees, so one beat (180 deg)
+            # lasts avg_gap * 180 / base_angle samples.
+            base_gap = avg_gap * 180.0 / args.base_angle
             initial_bpm = bpm_for_gap_f(args.rate, base_gap)
             theta, mult = angle_path(np.diff(np.asarray(hits, dtype=np.int64)), base_gap)
             if args.steer_depth > 0 and len(theta):
@@ -1174,7 +1187,8 @@ def main() -> int:
         print(f"SetHitsound: {volume_events:,}")
     print(f"file size  : {output.stat().st_size / 1e6:,.1f} MB")
     if base_gap is not None:
-        print(f"base BPM   : {60 * args.rate / base_gap:,.3f} (avg gap {base_gap:.4f} samples)")
+        print(f"base BPM   : {60 * args.rate / base_gap:,.3f} "
+              f"(1 beat = {base_gap:.4f} samples, avg gap = {args.base_angle:g} deg)")
     else:
         print(f"max BPM    : {60 * args.rate:,.0f}")
     print(f"chart      : {output}")
