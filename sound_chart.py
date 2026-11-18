@@ -32,11 +32,16 @@ def run_ffmpeg(args: list[str]) -> None:
     subprocess.run(["ffmpeg", "-y", "-v", "error", *args], check=True)
 
 
-def decode_mono_f32(source: Path, raw_path: Path, rate: int) -> int:
+def decode_mono_f32(source: Path, raw_path: Path, rate: int, highpass: float = 0.0) -> int:
+    filters = []
+    if highpass > 0:
+        # Two 2-pole high-passes = 4th order (24 dB/oct) low cut.
+        filters = ["-af", f"highpass=f={highpass:g},highpass=f={highpass:g}"]
     run_ffmpeg([
         "-i", str(source),
         "-ac", "1",
         "-ar", str(rate),
+        *filters,
         "-f", "f32le",
         str(raw_path),
     ])
@@ -657,8 +662,9 @@ def parse_args() -> argparse.Namespace:
         "--min-freq",
         type=float,
         default=20.0,
-        help="pdm/tiles: drop pulses farther than 1/min-freq seconds from both "
-        "neighbours (isolated sub-audio clicks). 0 = keep all",
+        help="Lowest audible frequency. The input is high-passed (4th order) here, "
+        "and pdm/tiles pulses farther than 1/min-freq s from both neighbours "
+        "are dropped. 0 = off",
     )
     p.add_argument(
         "--path",
@@ -801,8 +807,9 @@ def main() -> int:
         raw_path = tmpdir / "audio.f32le"
         hit_path = tmpdir / "hits.i64"
 
-        print(f"[1/{steps}] Decoding mono PCM at {args.rate:,} Hz...")
-        sample_count = decode_mono_f32(args.input, raw_path, args.rate)
+        hp = f", high-pass {args.min_freq:g} Hz" if args.min_freq > 0 else ""
+        print(f"[1/{steps}] Decoding mono PCM at {args.rate:,} Hz{hp}...")
+        sample_count = decode_mono_f32(args.input, raw_path, args.rate, args.min_freq)
         if sample_count == 0:
             raise SystemExit("Decoded audio is empty")
         duration = sample_count / args.rate
