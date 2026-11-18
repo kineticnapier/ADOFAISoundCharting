@@ -20,6 +20,7 @@ DEFAULT_PERCENTILE = 99.5
 DENSITY_CENTER = 0.5
 DENSITY_SPAN = 0.49
 DEFAULT_MAX_DENSITY = 0.98
+DEFAULT_MAX_TILES = 100_000
 DEFAULT_ENV_MS = 10.0
 DEFAULT_GATE_DB = -60.0
 PCM_CHUNK_SAMPLES = 1_000_000
@@ -530,10 +531,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--engine",
         choices=("tiles", "playsound", "pdm"),
-        default="tiles",
-        help="tiles: one tile per sample, volume via SetHitsound (multi-level). "
+        default="pdm",
+        help="pdm: one tile per 1-bit pulse, constant hitsound volume (default). "
+        "tiles: one tile per sample, volume via SetHitsound (multi-level). "
         "playsound: few tiles, audio in PlaySound events (needs a renderer that "
-        "handles PlaySound). pdm: one tile per 1-bit pulse",
+        "handles PlaySound)",
     )
     p.add_argument(
         "--rate",
@@ -592,7 +594,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-tiles",
         type=int,
-        help="adaptive: lower the density so the chart has at most ~this many tiles",
+        default=DEFAULT_MAX_TILES,
+        help=f"pdm: lower the density so the chart has at most ~this many tiles "
+        f"(default {DEFAULT_MAX_TILES:,}; 0 = no limit)",
     )
     p.add_argument(
         "--env-ms",
@@ -631,11 +635,10 @@ def main() -> int:
         raise SystemExit("--percentile must be in (0, 100]")
     if not 0 < args.max_density <= 1:
         raise SystemExit("--max-density must be in (0, 1]")
-    if args.max_tiles is not None and args.max_tiles <= 0:
-        raise SystemExit("--max-tiles must be positive")
-    if args.max_tiles is not None and args.engine != "pdm":
-        raise SystemExit("--max-tiles only applies to --engine pdm "
-                         "(for tiles, lower --rate or shorten the clip)")
+    if args.max_tiles < 0:
+        raise SystemExit("--max-tiles must be >= 0")
+    if args.max_tiles == 0 or args.engine != "pdm":
+        args.max_tiles = None
     if args.env_ms <= 0:
         raise SystemExit("--env-ms must be positive")
     if args.tile_ms <= 0:

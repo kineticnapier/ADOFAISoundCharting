@@ -109,7 +109,7 @@ Large inputs can create **hundreds of megabytes of JSON** and millions of tiles/
 
 ## Engines
 
-### `--engine tiles` (default)
+### `--engine tiles`
 
 One straight tile per non-zero sample; the hit **volume** carries the amplitude.
 
@@ -192,9 +192,13 @@ Events use the editor's field set:
 `--compact-events` drops `offset`/`playDuration`/`pitch`/`eventTag` (~35% smaller
 JSON) if the game accepts events without them.
 
-### `--engine pdm`
+### `--engine pdm` (default)
 
-One tile per 1-bit pulse; timing encoded with `SetSpeed`. See below.
+One tile per 1-bit pulse at a constant hitsound volume; timing encoded with
+`SetSpeed` (placed on the floor the travel starts from). `--max-tiles` defaults
+to 100,000 (`--max-tiles 0` disables it). 10 s clip at the default cap:
+99,999 tiles, 65k SetSpeed, 7.7 MB, simulated SNR 6.5 dB (12.6 dB uncapped with
+189k tiles).
 
 ## PDM mapping
 
