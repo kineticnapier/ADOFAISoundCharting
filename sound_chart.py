@@ -531,7 +531,10 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GATE_DB,
         help="adaptive: envelope below this level (dBFS after normalization) emits no tiles",
     )
-    p.add_argument("--silence-name", default="silence.ogg", help="Silent OGG file name")
+    p.add_argument(
+        "--silence-name",
+        help="Silent OGG file name (default: <chart name>_silence.ogg)",
+    )
     p.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     return p.parse_args()
 
@@ -566,7 +569,7 @@ def main() -> int:
     if output.suffix.lower() != ".adofai":
         output = output.with_suffix(".adofai")
     output.parent.mkdir(parents=True, exist_ok=True)
-    silence = output.parent / args.silence_name
+    silence = output.parent / (args.silence_name or f"{output.stem}_silence.ogg")
 
     if not args.force:
         existing = [p for p in (output, silence) if p.exists()]

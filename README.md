@@ -94,7 +94,7 @@ For `song.ogg`, the default output is:
 
 ```text
 song_sound_chart.adofai
-silence.ogg
+song_sound_chart_silence.ogg
 ```
 
 The generated level contains:
