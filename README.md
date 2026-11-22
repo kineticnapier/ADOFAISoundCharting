@@ -154,7 +154,10 @@ of 60°, so the route lives on a triangular lattice and draws hexagons/hexagrams
   (6−k)·60° with the same timing (Twirl on floor j applies to floor j,
   `scnGame` sets `isCCW` after toggling). The look-ahead search
   (`--steer-depth`) picks Twirls that keep the path inside `--shape`
-  (`hexagram` or `circle`) and avoid revisiting cells.
+  (`hexagram`, `circle` or `koch` snowflake) and avoid revisiting cells.
+  The Koch outline's order is chosen so its smallest edge is ~4 lattice steps
+  (order 3 for 100k tiles at `--fill 3`, higher for longer songs); all its
+  edges are 60° multiples, so it sits exactly on the lattice.
 - `--fill` (default 3) = tiles per lattice point; it sets the shape's size.
 
 10 s clip, 100k tiles: 19,830 SetSpeed + ~150–500 Twirl, 2.6 MB.

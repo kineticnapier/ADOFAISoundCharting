@@ -512,7 +512,72 @@ def lattice_plan(gaps: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return k, mult
 
 
+def koch_order(radius: float) -> int:
+    """Deepest order whose smallest edge is still >= ~4 lattice steps."""
+    side = radius * math.sqrt(3)
+    return max(0, int(math.floor(math.log(max(side / 4.0, 1.0), 3))))
+
+
+def koch_polygon(radius: float, order: int) -> np.ndarray:
+    """Koch snowflake vertices (x, y), circumradius of the base triangle = radius."""
+    ang = np.radians([90.0, 210.0, 330.0])
+    pts = np.c_[radius * np.cos(ang), radius * np.sin(ang)]
+    rot = np.array([[0.5, math.sqrt(3) / 2], [-math.sqrt(3) / 2, 0.5]])  # -60 deg
+    for _ in range(order):
+        a = pts
+        b = np.roll(pts, -1, axis=0)
+        d = (b - a) / 3.0
+        p1 = a + d
+        p3 = a + 2 * d
+        p2 = p1 + d @ rot.T  # bump outward for clockwise-ordered vertices
+        pts = np.stack([a, p1, p2, p3], axis=1).reshape(-1, 2)
+    return pts
+
+
+class _LatticeMask:
+    """Precomputed inside/outside table on the lattice (scanline fill)."""
+
+    def __init__(self, poly: np.ndarray) -> None:
+        h = math.sqrt(3) / 2
+        ymin, ymax = poly[:, 1].min(), poly[:, 1].max()
+        xmin, xmax = poly[:, 0].min(), poly[:, 0].max()
+        r0 = int(math.floor(ymin / h)) - 1
+        r1 = int(math.ceil(ymax / h)) + 1
+        q0 = int(math.floor(xmin - r1 / 2)) - 2
+        q1 = int(math.ceil(xmax - r0 / 2)) + 2
+        self.q0, self.r0 = q0, r0
+        self.mask = np.zeros((q1 - q0 + 1, r1 - r0 + 1), dtype=bool)
+        a = poly
+        b = np.roll(poly, -1, axis=0)
+        qs = np.arange(q0, q1 + 1)
+        for r in range(r0, r1 + 1):
+            y = r * h
+            cross = ((a[:, 1] <= y) & (b[:, 1] > y)) | ((b[:, 1] <= y) & (a[:, 1] > y))
+            if not cross.any():
+                continue
+            aa, bb = a[cross], b[cross]
+            xs = np.sort(aa[:, 0] + (y - aa[:, 1]) * (bb[:, 0] - aa[:, 0]) / (bb[:, 1] - aa[:, 1]))
+            x = qs + 0.5 * r
+            self.mask[:, r - r0] = (np.searchsorted(xs, x) % 2) == 1
+
+    def contains(self, q: np.ndarray, r: np.ndarray) -> np.ndarray:
+        i = q - self.q0
+        j = r - self.r0
+        ok = (i >= 0) & (i < self.mask.shape[0]) & (j >= 0) & (j < self.mask.shape[1])
+        out = np.zeros(np.shape(q), dtype=bool)
+        out[ok] = self.mask[i[ok], j[ok]]
+        return out
+
+
+_MASKS: dict = {}
+
+
 def in_shape(q: np.ndarray, r: np.ndarray, shape: str, radius: float) -> np.ndarray:
+    if shape == "koch":
+        key = (shape, round(radius, 6))
+        if key not in _MASKS:
+            _MASKS[key] = _LatticeMask(koch_polygon(radius, koch_order(radius)))
+        return _MASKS[key].contains(np.asarray(q), np.asarray(r))
     x = q + 0.5 * r
     y = r * (math.sqrt(3) / 2)
     if shape == "circle":
@@ -529,6 +594,8 @@ def shape_radius(n: int, shape: str, fill: float) -> float:
     pts = n / max(fill, 1e-6)
     if shape == "circle":  # lattice density 2/sqrt(3) per unit area
         return math.sqrt(pts * math.sqrt(3) / (2 * math.pi))
+    if shape == "koch":  # area 8/5 of the base triangle -> 2.4 R^2 points
+        return math.sqrt(pts / 2.4)
     return math.sqrt(pts / 2)  # hexagram area sqrt(3) R^2 -> 2 R^2 points
 
 
@@ -994,7 +1061,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--shape",
-        choices=("hexagram", "circle"),
+        choices=("hexagram", "circle", "koch"),
         default="hexagram",
         help="lattice path: region the Twirl steering keeps the path inside",
     )
@@ -1302,8 +1369,9 @@ def main() -> int:
             k, mult = lattice_plan(np.diff(np.asarray(hits, dtype=np.int64)))
             radius = shape_radius(floors, args.shape, args.fill)
             depth = args.steer_depth if args.steer_depth > 0 else 0
+            extra = f", Koch order {koch_order(radius)}" if args.shape == "koch" else ""
             print(f"[4/5] Steering lattice path inside a {args.shape} "
-                  f"(radius {radius:,.0f}, depth {depth})...")
+                  f"(radius {radius:,.0f}{extra}, depth {depth})...")
             twirl = steer_lattice(k, depth, args.shape, radius)
             absolute = lattice_angles(k, twirl)
             cells = lattice_cells(k, twirl)
