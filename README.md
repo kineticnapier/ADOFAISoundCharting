@@ -159,6 +159,14 @@ of 60°, so the route lives on a triangular lattice and draws hexagons/hexagrams
   (order 3 for 100k tiles at `--fill 3`, higher for longer songs); all its
   edges are 60° multiples, so it sits exactly on the lattice.
 - `--fill` (default 3) = tiles per lattice point; it sets the shape's size.
+- `--trace` (koch only) puts every floor **on** the snowflake outline instead
+  of filling it. The outline at full order is a sequence of unit lattice steps,
+  so each floor's required turn is known. A gap's natural turn is used when it
+  or its Twirl mirror matches; otherwise the floor gets a SetSpeed
+  (`mult = k/gap`) so the required angle plays in the same time. The order
+  defaults to the largest whose lap fits (`--koch-order`), `--koch-segment`
+  sets floors per smallest edge. Exact shape, but most floors need a SetSpeed
+  (10 s / 100k tiles: 85,887 SetSpeed + 8,409 Twirl, 10.6 MB).
 
 10 s clip, 100k tiles: 19,830 SetSpeed + ~150–500 Twirl, 2.6 MB.
 

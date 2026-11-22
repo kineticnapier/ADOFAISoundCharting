@@ -686,6 +686,53 @@ def steer_lattice(
     return twirl
 
 
+def koch_directions(order: int, seg: int) -> np.ndarray:
+    """Lattice direction (0..5) of every unit step around a Koch snowflake.
+
+    Clockwise traversal, bumps outward: each edge F -> F + F - - F + F, i.e.
+    sub-edge offsets [0, +1, -1, 0] per base-4 digit; the three sides are
+    rotated by -2 (120 deg clockwise). Each edge is `seg` steps long.
+    """
+    i = np.arange(4 ** order)
+    rel = np.array([0, 1, -1, 0])
+    d = np.zeros(len(i), dtype=np.int64)
+    for _ in range(order):
+        d += rel[i % 4]
+        i //= 4
+    side = np.concatenate([d, d - 2, d - 4])
+    return np.repeat(np.mod(side, 6), seg)
+
+
+def trace_koch(gaps: np.ndarray, order: int, seg: int):
+    """Put every floor exactly on a Koch snowflake outline (repeating laps).
+
+    The turn needed at each floor comes from the outline. A gap's natural turn
+    (k = gap, at the base speed) is used when it or its Twirl mirror (6 - k)
+    matches; the rotation is only flipped (Twirl) when that makes it match.
+    Otherwise the floor keeps its rotation and gets a SetSpeed (mult = k/gap)
+    so the required angle plays in the same time.
+
+    Returns k, mult, twirl (bool per gap).
+    """
+    n = len(gaps)
+    lap = koch_directions(order, seg)
+    dirs = lap[np.arange(n + 1) % len(lap)]       # exit direction of floors 0..n
+    t = np.mod(np.diff(dirs) + 3, 6) - 3          # needed turn, -2..2 (never 3)
+    g = gaps.astype(np.int64)
+    k0 = np.where(g <= 5, g, -99)
+    cw_ok = k0 == 3 - t
+    ccw_ok = k0 == 3 + t
+    forced = np.where(cw_ok & ~ccw_ok, 1, np.where(ccw_ok & ~cw_ok, -1, 0))
+    # Forward-fill the forced rotations; start clockwise.
+    idx = np.where(forced != 0, np.arange(n), -1)
+    np.maximum.accumulate(idx, out=idx)
+    spin = np.where(idx >= 0, forced[np.maximum(idx, 0)], 1)
+    twirl = np.diff(np.concatenate([[1], spin])) != 0
+    k = 3 - spin * t
+    mult = k / np.maximum(g, 1)
+    return k.astype(np.int64), mult, twirl
+
+
 def lattice_angles(k: np.ndarray, twirl: np.ndarray) -> np.ndarray:
     """Absolute angleData (multiples of 60) for floors 0..n (n = len(k))."""
     spin = np.where(np.cumsum(twirl) % 2 == 1, -1, 1)
@@ -1066,6 +1113,23 @@ def parse_args() -> argparse.Namespace:
         help="lattice path: region the Twirl steering keeps the path inside",
     )
     p.add_argument(
+        "--trace",
+        action="store_true",
+        help="lattice path: put the floors ON the shape's outline instead of filling "
+        "it (koch only). Floors whose natural angle does not fit get a SetSpeed",
+    )
+    p.add_argument(
+        "--koch-order",
+        type=int,
+        help="--trace: Koch order (default: largest whose lap fits in the chart)",
+    )
+    p.add_argument(
+        "--koch-segment",
+        type=int,
+        default=1,
+        help="--trace: floors per smallest Koch edge",
+    )
+    p.add_argument(
         "--fill",
         type=float,
         default=3.0,
@@ -1366,19 +1430,33 @@ def main() -> int:
         if args.path == "lattice":
             base_gap = float(LATTICE_SAMPLES_PER_BEAT)
             initial_bpm = bpm_for_gap_f(args.rate, base_gap)
-            k, mult = lattice_plan(np.diff(np.asarray(hits, dtype=np.int64)))
+            gaps_all = np.diff(np.asarray(hits, dtype=np.int64))
+            k, mult = lattice_plan(gaps_all)
             radius = shape_radius(floors, args.shape, args.fill)
             depth = args.steer_depth if args.steer_depth > 0 else 0
             extra = f", Koch order {koch_order(radius)}" if args.shape == "koch" else ""
             print(f"[4/5] Steering lattice path inside a {args.shape} "
                   f"(radius {radius:,.0f}{extra}, depth {depth})...")
-            twirl = steer_lattice(k, depth, args.shape, radius)
+            if args.trace:
+                if args.shape != "koch":
+                    raise SystemExit("--trace currently supports --shape koch only")
+                seg = max(1, args.koch_segment)
+                order = args.koch_order
+                if order is None:
+                    order = max(1, int(math.floor(math.log(max(floors / (3 * seg), 4), 4))))
+                lap = 3 * 4 ** order * seg
+                print(f"      tracing Koch order {order}: {lap:,} floors per lap, "
+                      f"{floors / lap:.2f} laps")
+                k, mult, twirl = trace_koch(gaps_all, order, seg)
+            else:
+                twirl = steer_lattice(k, depth, args.shape, radius)
             absolute = lattice_angles(k, twirl)
             cells = lattice_cells(k, twirl)
             key = cells[:, 0] * 4_294_967_296 + cells[:, 1]
             inside = in_shape(cells[:, 0], cells[:, 1], args.shape, radius).mean()
+            where = "" if args.trace else f"inside shape: {inside:.1%}, "
             print(f"      overlapping floors: {1 - len(np.unique(key)) / len(key):.1%}, "
-                  f"inside shape: {inside:.1%}, Twirl: {int(twirl.sum()):,}")
+                  f"{where}Twirl: {int(twirl.sum()):,}")
         elif args.path == "angle":
             avg_gap = (
                 (int(hits[-1]) - int(hits[0])) / (floors - 1) if floors > 1 else float(initial_gap)
