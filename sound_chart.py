@@ -703,6 +703,108 @@ def koch_directions(order: int, seg: int) -> np.ndarray:
     return np.repeat(np.mod(side, 6), seg)
 
 
+def lsystem_directions(
+    axiom: str, rules: dict, order: int, ndirs: int, seg: int = 1
+) -> np.ndarray:
+    """Directions (0..ndirs-1) of every 'F'-type step of an L-system curve.
+
+    '+' turns +1 (counter-clockwise), '-' turns -1; only 'F' draws a unit step.
+    """
+    text = axiom
+    for _ in range(order):
+        text = "".join(rules.get(ch, ch) for ch in text)
+    raw = np.frombuffer(text.encode("ascii"), dtype=np.uint8)
+    turn = np.where(raw == ord("+"), 1, np.where(raw == ord("-"), -1, 0))
+    heading = np.cumsum(turn)
+    draws = raw == ord("F")
+    return np.repeat(np.mod(heading[draws], ndirs), seg)
+
+
+# Closed Hilbert loop (Moore curve): fills a square, laps join seamlessly.
+MOORE = ("LFL+F+LFL+F", {"L": "-RF+LFL+FR-", "R": "+LF-RFR-FL+"})
+# Gosper curve (flowsnake), 60 deg: fills a snowflake-like island.
+# (X/Y form: only F draws; this variant is self-avoiding on the lattice.)
+GOSPER = ("XF", {"X": "X+YF++YF-FX--FXFX-YF+", "Y": "-FX+YFYF++YF+FX--FX-Y"})
+
+
+def curve_lap(curve: str, order: int, seg: int) -> tuple[np.ndarray, int]:
+    """One lap of unit-step directions and the lattice size (4 or 6)."""
+    if curve == "koch":
+        return koch_directions(order, seg), 6
+    if curve == "hilbert":
+        axiom, rules = MOORE
+        return lsystem_directions(axiom, rules, max(order - 1, 0), 4, seg), 4
+    if curve == "gosper":
+        axiom, rules = GOSPER
+        d = lsystem_directions(axiom, rules, order, 6, seg)
+        # Open curve: walk it, U-turn, walk it back (ping-pong laps).
+        return np.concatenate([d, np.mod(d[::-1] + 3, 6)]), 6
+    raise ValueError(curve)
+
+
+def curve_lap_length(curve: str, order: int, seg: int) -> int:
+    if curve == "koch":
+        return 3 * 4 ** order * seg
+    if curve == "hilbert":
+        return 4 ** order * seg          # Moore curve of order n: 4^n steps
+    return 2 * 7 ** order * seg          # Gosper there and back
+
+
+def auto_curve_order(curve: str, floors: int, seg: int) -> int:
+    order = 1
+    while curve_lap_length(curve, order + 1, seg) <= floors:
+        order += 1
+    return order
+
+
+def auto_curve_fit(curve: str, floors: int, max_seg: int = 8) -> tuple[int, int]:
+    """(order, segment) whose single lap covers the chart most completely.
+
+    Picks the lap closest to `floors` without exceeding it; ties go to the
+    higher order (finer detail).
+    """
+    best = (1, 1)
+    best_len = 0
+    order = 1
+    while curve_lap_length(curve, order, 1) <= floors:
+        seg = min(max_seg, floors // curve_lap_length(curve, order, 1))
+        length = curve_lap_length(curve, order, seg)
+        if length >= best_len:
+            best, best_len = (order, seg), length
+        order += 1
+    return best
+
+
+def trace_curve(gaps: np.ndarray, lap: np.ndarray, ndirs: int):
+    """Put every floor exactly on a repeating lattice curve.
+
+    One sample is 360/ndirs degrees at the base BPM, so a gap g turns k = g
+    units; Twirl mirrors k to ndirs - k. The needed turn t comes from the
+    curve. Natural (or mirrored) turns are used when they match, flipping the
+    rotation only when that makes them match; otherwise the floor keeps its
+    rotation and gets a SetSpeed (mult = k/gap). A U-turn uses k = ndirs.
+
+    Returns k, mult, twirl (bool per gap).
+    """
+    half = ndirs // 2
+    n = len(gaps)
+    dirs = lap[np.arange(n + 1) % len(lap)]
+    t = np.mod(np.diff(dirs) + half, ndirs) - half      # -half..half-1
+    g = gaps.astype(np.int64)
+    k0 = np.where(g <= ndirs - 1, g, -99)
+    cw_ok = k0 == half - t
+    ccw_ok = k0 == half + t
+    forced = np.where(cw_ok & ~ccw_ok, 1, np.where(ccw_ok & ~cw_ok, -1, 0))
+    idx = np.where(forced != 0, np.arange(n), -1)
+    np.maximum.accumulate(idx, out=idx)
+    spin = np.where(idx >= 0, forced[np.maximum(idx, 0)], 1)
+    twirl = np.diff(np.concatenate([[1], spin])) != 0
+    k = half - spin * t
+    k = np.where(k <= 0, k + ndirs, k)                  # U-turn: full 360
+    mult = k / np.maximum(g, 1)
+    return k.astype(np.int64), mult, twirl
+
+
 def trace_koch(gaps: np.ndarray, order: int, seg: int):
     """Put every floor exactly on a Koch snowflake outline (repeating laps).
 
@@ -733,16 +835,20 @@ def trace_koch(gaps: np.ndarray, order: int, seg: int):
     return k.astype(np.int64), mult, twirl
 
 
-def lattice_angles(k: np.ndarray, twirl: np.ndarray) -> np.ndarray:
-    """Absolute angleData (multiples of 60) for floors 0..n (n = len(k))."""
+def lattice_angles(k: np.ndarray, twirl: np.ndarray, ndirs: int = 6) -> np.ndarray:
+    """Absolute angleData (multiples of 360/ndirs) for floors 0..n (n = len(k))."""
     spin = np.where(np.cumsum(twirl) % 2 == 1, -1, 1)
-    dirs = np.mod(np.cumsum(spin * (3 - k)), 6)
-    return np.concatenate([[0], dirs * 60]).astype(np.int64)
+    dirs = np.mod(np.cumsum(spin * (ndirs // 2 - k)), ndirs)
+    return np.concatenate([[0], dirs * (360 // ndirs)]).astype(np.int64)
 
 
-def lattice_cells(k: np.ndarray, twirl: np.ndarray) -> np.ndarray:
-    dirs = lattice_angles(k, twirl) // 60
-    return np.cumsum(LATTICE_DIRS[dirs], axis=0)
+SQUARE_DIRS = np.array([(1, 0), (0, 1), (-1, 0), (0, -1)], dtype=np.int64)
+
+
+def lattice_cells(k: np.ndarray, twirl: np.ndarray, ndirs: int = 6) -> np.ndarray:
+    dirs = lattice_angles(k, twirl, ndirs) // (360 // ndirs)
+    table = LATTICE_DIRS if ndirs == 6 else SQUARE_DIRS
+    return np.cumsum(table[dirs], axis=0)
 
 
 def write_angles(f, n: int, theta: np.ndarray | None, absolute: np.ndarray | None = None) -> None:
@@ -1114,20 +1220,28 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--trace",
-        action="store_true",
-        help="lattice path: put the floors ON the shape's outline instead of filling "
-        "it (koch only). Floors whose natural angle does not fit get a SetSpeed",
+        nargs="?",
+        const="koch",
+        choices=("koch", "hilbert", "gosper"),
+        help="lattice path: put every floor ON a curve instead of steering: koch "
+        "(snowflake outline), hilbert (closed Hilbert/Moore curve filling a square, "
+        "90-deg lattice), gosper (flowsnake filling a snowflake-like island). "
+        "Floors whose natural angle does not fit get a SetSpeed",
     )
     p.add_argument(
+        "--curve-order",
         "--koch-order",
+        dest="curve_order",
         type=int,
-        help="--trace: Koch order (default: largest whose lap fits in the chart)",
+        help="--trace: curve order (default: largest whose lap fits in the chart)",
     )
     p.add_argument(
+        "--curve-segment",
         "--koch-segment",
+        dest="curve_segment",
         type=int,
-        default=1,
-        help="--trace: floors per smallest Koch edge",
+        help="--trace: floors per smallest curve edge (default: chosen with the "
+        "order so one lap covers the chart)",
     )
     p.add_argument(
         "--fill",
@@ -1428,7 +1542,8 @@ def main() -> int:
         base_gap = None
         theta = mult = twirl = absolute = None
         if args.path == "lattice":
-            base_gap = float(LATTICE_SAMPLES_PER_BEAT)
+            ndirs = 4 if args.trace == "hilbert" else 6
+            base_gap = float(ndirs // 2)  # one sample = 360/ndirs degrees
             initial_bpm = bpm_for_gap_f(args.rate, base_gap)
             gaps_all = np.diff(np.asarray(hits, dtype=np.int64))
             k, mult = lattice_plan(gaps_all)
@@ -1438,20 +1553,19 @@ def main() -> int:
             print(f"[4/5] Steering lattice path inside a {args.shape} "
                   f"(radius {radius:,.0f}{extra}, depth {depth})...")
             if args.trace:
-                if args.shape != "koch":
-                    raise SystemExit("--trace currently supports --shape koch only")
-                seg = max(1, args.koch_segment)
-                order = args.koch_order
-                if order is None:
-                    order = max(1, int(math.floor(math.log(max(floors / (3 * seg), 4), 4))))
-                lap = 3 * 4 ** order * seg
-                print(f"      tracing Koch order {order}: {lap:,} floors per lap, "
-                      f"{floors / lap:.2f} laps")
-                k, mult, twirl = trace_koch(gaps_all, order, seg)
+                if args.curve_order is None and args.curve_segment is None:
+                    order, seg = auto_curve_fit(args.trace, floors)
+                else:
+                    seg = max(1, args.curve_segment or 1)
+                    order = args.curve_order or auto_curve_order(args.trace, floors, seg)
+                lap, _ = curve_lap(args.trace, order, seg)
+                print(f"      tracing {args.trace} order {order}: {len(lap):,} floors per lap, "
+                      f"{floors / len(lap):.2f} laps")
+                k, mult, twirl = trace_curve(gaps_all, lap, ndirs)
             else:
                 twirl = steer_lattice(k, depth, args.shape, radius)
-            absolute = lattice_angles(k, twirl)
-            cells = lattice_cells(k, twirl)
+            absolute = lattice_angles(k, twirl, ndirs)
+            cells = lattice_cells(k, twirl, ndirs)
             key = cells[:, 0] * 4_294_967_296 + cells[:, 1]
             inside = in_shape(cells[:, 0], cells[:, 1], args.shape, radius).mean()
             where = "" if args.trace else f"inside shape: {inside:.1%}, "

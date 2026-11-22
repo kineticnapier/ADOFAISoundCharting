@@ -159,8 +159,13 @@ of 60°, so the route lives on a triangular lattice and draws hexagons/hexagrams
   (order 3 for 100k tiles at `--fill 3`, higher for longer songs); all its
   edges are 60° multiples, so it sits exactly on the lattice.
 - `--fill` (default 3) = tiles per lattice point; it sets the shape's size.
-- `--trace` (koch only) puts every floor **on** the snowflake outline instead
-  of filling it. The outline at full order is a sequence of unit lattice steps,
+- `--trace koch|hilbert|gosper` puts every floor **on** a curve:
+  `koch` = snowflake outline, `hilbert` = closed Hilbert (Moore) curve that
+  fills a square on a 90° lattice (one sample = 90°), `gosper` = flowsnake
+  that fills a snowflake-like island on the 60° lattice (walked there and back).
+  Order and edge length are picked so one lap covers the chart
+  (`--curve-order`, `--curve-segment` override).
+- For `koch`, every floor sits on the snowflake outline. The outline at full order is a sequence of unit lattice steps,
   so each floor's required turn is known. A gap's natural turn is used when it
   or its Twirl mirror matches; otherwise the floor gets a SetSpeed
   (`mult = k/gap`) so the required angle plays in the same time. The order
