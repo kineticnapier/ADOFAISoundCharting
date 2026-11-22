@@ -499,16 +499,44 @@ LATTICE_OUTSIDE_COST = 3.0     # per floor outside the target shape
 LATTICE_TWIRL_COST = 0.05      # per Twirl event
 
 
-def lattice_plan(gaps: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def choose_lattice_unit(gaps: np.ndarray, ndirs: int, max_unit: int = 4096) -> int:
+    """Samples per lattice step (360/ndirs deg) that lets the most gaps turn
+    naturally, i.e. gap = k * unit with 1 <= k <= ndirs - 1 (no SetSpeed)."""
+    g = gaps.astype(np.int64)
+    if not len(g):
+        return 1
+    top = int(min(g.max(), max_unit * (ndirs - 1)))
+    hist = np.bincount(np.clip(g, 0, top + 1), minlength=top + 2)
+    best_u, best = 1, -1
+    for u in range(1, max(1, top // 1) + 1):
+        qs = np.arange(1, ndirs) * u
+        qs = qs[qs <= top]
+        if not len(qs):
+            break
+        score = int(hist[qs].sum())
+        if score > best:
+            best_u, best = u, score
+    return best_u
+
+
+def natural_turn(gaps: np.ndarray, unit: int, ndirs: int) -> np.ndarray:
+    """k for gaps that are a whole number (1..ndirs-1) of lattice units, else -99."""
+    g = gaps.astype(np.int64)
+    q, r = np.divmod(g, unit)
+    return np.where((r == 0) & (q >= 1) & (q <= ndirs - 1), q, -99)
+
+
+def lattice_plan(gaps: np.ndarray, unit: int = 1) -> tuple[np.ndarray, np.ndarray]:
     """Turn k (in 60 deg units, 1..5) and speed multiplier per gap.
 
-    At the base BPM one sample is 60 deg, so gaps of 1..5 samples are played
-    as k = gap at the base speed. Longer gaps go straight (k = 3) with the speed
-    lowered to 3/gap, which keeps every floor on the lattice.
+    At the base BPM one lattice unit (`unit` samples) is 60 deg, so a gap of
+    k units (k = 1..5) plays at the base speed. Other gaps go straight (k = 3)
+    with the speed set to 3*unit/gap, which keeps every floor on the lattice.
     """
     g = gaps.astype(np.int64)
-    k = np.where(g <= 5, g, 3).astype(np.int64)
-    mult = np.where(g <= 5, 1.0, 3.0 / np.maximum(g, 1))
+    k0 = natural_turn(g, unit, 6)
+    k = np.where(k0 > 0, k0, 3).astype(np.int64)
+    mult = np.where(k0 > 0, 1.0, 3.0 * unit / np.maximum(g, 1))
     return k, mult
 
 
@@ -747,7 +775,7 @@ def curve_lap_length(curve: str, order: int, seg: int) -> int:
         return 3 * 4 ** order * seg
     if curve == "hilbert":
         return 4 ** order * seg          # Moore curve of order n: 4^n steps
-    return 2 * 7 ** order * seg          # Gosper there and back
+    return 7 ** order * seg              # Gosper one way (fit so it is not retraced)
 
 
 def auto_curve_order(curve: str, floors: int, seg: int) -> int:
@@ -775,7 +803,7 @@ def auto_curve_fit(curve: str, floors: int, max_seg: int = 8) -> tuple[int, int]
     return best
 
 
-def trace_curve(gaps: np.ndarray, lap: np.ndarray, ndirs: int):
+def trace_curve(gaps: np.ndarray, lap: np.ndarray, ndirs: int, unit: int = 1):
     """Put every floor exactly on a repeating lattice curve.
 
     One sample is 360/ndirs degrees at the base BPM, so a gap g turns k = g
@@ -791,7 +819,7 @@ def trace_curve(gaps: np.ndarray, lap: np.ndarray, ndirs: int):
     dirs = lap[np.arange(n + 1) % len(lap)]
     t = np.mod(np.diff(dirs) + half, ndirs) - half      # -half..half-1
     g = gaps.astype(np.int64)
-    k0 = np.where(g <= ndirs - 1, g, -99)
+    k0 = natural_turn(g, unit, ndirs)
     cw_ok = k0 == half - t
     ccw_ok = k0 == half + t
     forced = np.where(cw_ok & ~ccw_ok, 1, np.where(ccw_ok & ~cw_ok, -1, 0))
@@ -801,7 +829,7 @@ def trace_curve(gaps: np.ndarray, lap: np.ndarray, ndirs: int):
     twirl = np.diff(np.concatenate([[1], spin])) != 0
     k = half - spin * t
     k = np.where(k <= 0, k + ndirs, k)                  # U-turn: full 360
-    mult = k / np.maximum(g, 1)
+    mult = k * unit / np.maximum(g, 1)
     return k.astype(np.int64), mult, twirl
 
 
@@ -1244,6 +1272,12 @@ def parse_args() -> argparse.Namespace:
         "order so one lap covers the chart)",
     )
     p.add_argument(
+        "--lattice-unit",
+        type=int,
+        help="lattice path: samples per lattice step (60 or 90 deg). Default: the "
+        "unit that lets the most gaps turn without a SetSpeed",
+    )
+    p.add_argument(
         "--fill",
         type=float,
         default=3.0,
@@ -1493,6 +1527,11 @@ def main() -> int:
                 if base * density_scale > args.max_tiles:
                     density_scale = args.max_tiles / base
                     print(f"      --max-tiles: density scaled to {density_scale:.4g}")
+                    if density_scale < 0.25 * args.max_density:
+                        print(f"      WARNING: squeezing into {args.max_tiles:,} tiles keeps only "
+                              f"{density_scale / args.max_density:.0%} of the pulses; the sound "
+                              "will be mostly noise. Use --max-tiles 0 if your editor can "
+                              "open bigger charts.")
 
         if args.engine == "tiles":
             vol_path = tmpdir / "vols.i16"
@@ -1543,15 +1582,20 @@ def main() -> int:
         theta = mult = twirl = absolute = None
         if args.path == "lattice":
             ndirs = 4 if args.trace == "hilbert" else 6
-            base_gap = float(ndirs // 2)  # one sample = 360/ndirs degrees
-            initial_bpm = bpm_for_gap_f(args.rate, base_gap)
             gaps_all = np.diff(np.asarray(hits, dtype=np.int64))
-            k, mult = lattice_plan(gaps_all)
+            unit = args.lattice_unit or choose_lattice_unit(gaps_all, ndirs)
+            base_gap = float(ndirs // 2 * unit)  # one unit = 360/ndirs degrees
+            initial_bpm = bpm_for_gap_f(args.rate, base_gap)
+            natural = float((natural_turn(gaps_all, unit, ndirs) > 0).mean()) if len(gaps_all) else 0.0
+            print(f"      lattice unit: {unit} sample(s) = {360 // ndirs} deg "
+                  f"({natural:.0%} of gaps turn without SetSpeed)")
+            k, mult = lattice_plan(gaps_all, unit)
             radius = shape_radius(floors, args.shape, args.fill)
             depth = args.steer_depth if args.steer_depth > 0 else 0
-            extra = f", Koch order {koch_order(radius)}" if args.shape == "koch" else ""
-            print(f"[4/5] Steering lattice path inside a {args.shape} "
-                  f"(radius {radius:,.0f}{extra}, depth {depth})...")
+            if not args.trace:
+                extra = f", Koch order {koch_order(radius)}" if args.shape == "koch" else ""
+                print(f"      steering inside a {args.shape} "
+                      f"(radius {radius:,.0f}{extra}, depth {depth})...")
             if args.trace:
                 if args.curve_order is None and args.curve_segment is None:
                     order, seg = auto_curve_fit(args.trace, floors)
@@ -1561,7 +1605,7 @@ def main() -> int:
                 lap, _ = curve_lap(args.trace, order, seg)
                 print(f"      tracing {args.trace} order {order}: {len(lap):,} floors per lap, "
                       f"{floors / len(lap):.2f} laps")
-                k, mult, twirl = trace_curve(gaps_all, lap, ndirs)
+                k, mult, twirl = trace_curve(gaps_all, lap, ndirs, unit)
             else:
                 twirl = steer_lattice(k, depth, args.shape, radius)
             absolute = lattice_angles(k, twirl, ndirs)
@@ -1582,7 +1626,7 @@ def main() -> int:
             theta, mult = angle_path(np.diff(np.asarray(hits, dtype=np.int64)), base_gap)
             if args.steer_depth > 0 and len(theta):
                 before = overlap_ratio(theta)
-                print(f"[4/5] Steering path (depth {args.steer_depth}, "
+                print(f"      steering path (depth {args.steer_depth}, "
                       f"2^{args.steer_depth} futures per step)...")
                 theta, mult = steer_angles(
                     theta, mult, args.steer_depth, spread=args.steer_spread
@@ -1632,8 +1676,10 @@ def main() -> int:
         print(f"SetHitsound: {volume_events:,}")
     print(f"file size  : {output.stat().st_size / 1e6:,.1f} MB")
     if base_gap is not None:
+        detail = (f"avg gap = {args.base_angle:g} deg" if args.path == "angle"
+                  else "lattice")
         print(f"base BPM   : {60 * args.rate / base_gap:,.3f} "
-              f"(1 beat = {base_gap:.4f} samples, avg gap = {args.base_angle:g} deg)")
+              f"(1 beat = {base_gap:.4f} samples, {detail})")
     else:
         print(f"max BPM    : {60 * args.rate:,.0f}")
     print(f"chart      : {output}")
