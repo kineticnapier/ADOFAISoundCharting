@@ -492,13 +492,158 @@ def steer_angles(
     return theta, mult
 
 
-def write_angles(f, n: int, theta: np.ndarray | None) -> None:
+# Triangular lattice: direction d (0..5) = 60*d degrees; axial unit steps.
+LATTICE_DIRS = np.array([(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)], dtype=np.int64)
+LATTICE_SAMPLES_PER_BEAT = 3   # 1 sample = 60 deg at the base BPM
+LATTICE_OUTSIDE_COST = 3.0     # per floor outside the target shape
+LATTICE_TWIRL_COST = 0.05      # per Twirl event
+
+
+def lattice_plan(gaps: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Turn k (in 60 deg units, 1..5) and speed multiplier per gap.
+
+    At the base BPM one sample is 60 deg, so gaps of 1..5 samples are played
+    as k = gap at the base speed. Longer gaps go straight (k = 3) with the speed
+    lowered to 3/gap, which keeps every floor on the lattice.
+    """
+    g = gaps.astype(np.int64)
+    k = np.where(g <= 5, g, 3).astype(np.int64)
+    mult = np.where(g <= 5, 1.0, 3.0 / np.maximum(g, 1))
+    return k, mult
+
+
+def in_shape(q: np.ndarray, r: np.ndarray, shape: str, radius: float) -> np.ndarray:
+    x = q + 0.5 * r
+    y = r * (math.sqrt(3) / 2)
+    if shape == "circle":
+        return x * x + y * y <= radius * radius
+    h = radius / 2
+    c30, s30 = math.sqrt(3) / 2, 0.5
+    up = (-y <= h) & (c30 * x + s30 * y <= h) & (-c30 * x + s30 * y <= h)
+    down = (y <= h) & (c30 * x - s30 * y <= h) & (-c30 * x - s30 * y <= h)
+    return up | down
+
+
+def shape_radius(n: int, shape: str, fill: float) -> float:
+    """Radius whose shape holds about n / fill lattice points."""
+    pts = n / max(fill, 1e-6)
+    if shape == "circle":  # lattice density 2/sqrt(3) per unit area
+        return math.sqrt(pts * math.sqrt(3) / (2 * math.pi))
+    return math.sqrt(pts / 2)  # hexagram area sqrt(3) R^2 -> 2 R^2 points
+
+
+def steer_lattice(
+    k: np.ndarray, depth: int, shape: str, radius: float, progress: bool = True
+) -> np.ndarray:
+    """Choose where to Twirl so the lattice walk stays inside the shape and
+    avoids revisiting cells. Twirling flips the rotation, which turns k into
+    6 - k with the same timing. All 2^depth toggle combinations of the next
+    `depth` turning floors are simulated; the best first half is committed.
+
+    Returns a bool array: Twirl on the floor of gap i.
+    """
+    n = len(k)
+    twirl = np.zeros(n, dtype=bool)
+    choices = np.flatnonzero(k != 3)
+    if not len(choices) or depth <= 0:
+        return twirl
+
+    bits_n = STEER_GRID_BITS
+    mask = (1 << bits_n) - 1
+    grid = np.full((1 << bits_n, 1 << bits_n), -1_000_000, dtype=np.int64)
+    combos = {}
+    turn3 = 3 - k  # direction change for clockwise rotation
+
+    # State before gap i: direction of floor i, cell of floor i+1, rotation.
+    d = 0
+    cell = LATTICE_DIRS[0].copy()
+    spin = 1
+    grid[0, 0] = 0
+    grid[cell[0] & mask, cell[1] & mask] = 1
+    done = 0
+    ci = 0
+    total = len(choices)
+    commit = max(1, depth // 2)
+    next_report = 0
+
+    def walk(g0: int, g1: int) -> None:
+        nonlocal d, cell, spin
+        if g1 <= g0:
+            return
+        flips = np.cumsum(twirl[g0:g1])
+        sp = spin * np.where(flips % 2 == 1, -1, 1)
+        dirs = np.mod(d + np.cumsum(sp * turn3[g0:g1]), 6)
+        pts = cell + np.cumsum(LATTICE_DIRS[dirs], axis=0)
+        grid[pts[:, 0] & mask, pts[:, 1] & mask] = np.arange(g0 + 2, g1 + 2)
+        d = int(dirs[-1])
+        cell = pts[-1]
+        spin = int(sp[-1])
+
+    while ci < total:
+        if progress and ci >= next_report:
+            print(f"      steering {ci / total:6.1%}", end="\r", flush=True)
+            next_report = ci + max(1, total // 200)
+        c = choices[ci:ci + depth]
+        kk = len(c)
+        g0 = int(c[0])
+        g1 = min(n, int(c[-1]) + 1 + STEER_RECENT)
+        walk(done, g0)
+        done = g0
+        if kk not in combos:
+            combos[kk] = ((np.arange(1 << kk)[:, None] >> np.arange(kk)) & 1).astype(bool)
+        bits = combos[kk]
+        L = g1 - g0
+        tog = np.zeros((len(bits), L), dtype=np.int64)
+        tog[:, c - g0] = bits
+        sp = spin * np.where(np.cumsum(tog, axis=1) % 2 == 1, -1, 1)
+        dirs = np.mod(d + np.cumsum(sp * turn3[g0:g1], axis=1), 6)
+        steps = LATTICE_DIRS[dirs]
+        q = cell[0] + np.cumsum(steps[..., 0], axis=1)
+        r = cell[1] + np.cumsum(steps[..., 1], axis=1)
+        last = grid[q & mask, r & mask]
+        idx = np.arange(g0 + 2, g1 + 2)
+        overlaps = ((idx - last) > STEER_RECENT).sum(axis=1)
+        outside = (~in_shape(q, r, shape, radius)).sum(axis=1)
+        cost = overlaps + LATTICE_OUTSIDE_COST * outside + LATTICE_TWIRL_COST * bits.sum(axis=1)
+        best = int(np.argmin(cost))
+        m = min(commit, kk)
+        twirl[c[:m][bits[best, :m]]] = True
+        g_end = int(c[m]) if m < kk else int(c[-1]) + 1
+        walk(g0, g_end)
+        done = g_end
+        ci += m
+
+    walk(done, n)
+    if progress:
+        print(" " * 40, end="\r")
+    return twirl
+
+
+def lattice_angles(k: np.ndarray, twirl: np.ndarray) -> np.ndarray:
+    """Absolute angleData (multiples of 60) for floors 0..n (n = len(k))."""
+    spin = np.where(np.cumsum(twirl) % 2 == 1, -1, 1)
+    dirs = np.mod(np.cumsum(spin * (3 - k)), 6)
+    return np.concatenate([[0], dirs * 60]).astype(np.int64)
+
+
+def lattice_cells(k: np.ndarray, twirl: np.ndarray) -> np.ndarray:
+    dirs = lattice_angles(k, twirl) // 60
+    return np.cumsum(LATTICE_DIRS[dirs], axis=0)
+
+
+def write_angles(f, n: int, theta: np.ndarray | None, absolute: np.ndarray | None = None) -> None:
     """angleData: floor 0 plus one entry per hit floor (len(hits) values).
 
     Straight path: all zeros. Angle path: the game computes the turn on floor j
     as mod(a[j-1] - a[j] - 180, 360) (exit = 90 - angleData, entry = previous
     exit + 180, clockwise), so a[j] = a[j-1] + 180 - theta[j].
     """
+    if absolute is not None:
+        for c in range(0, n, ANGLE_BLOCK):
+            if c:
+                f.write(",")
+            f.write(",".join(map(str, absolute[c:c + ANGLE_BLOCK].tolist())))
+        return
     if theta is None:
         write_zero_angles(f, n)
         return
@@ -522,6 +667,7 @@ def write_actions(
     hitsound: str = "Sidestick",
     base_gap: float | None = None,
     mult: np.ndarray | None = None,
+    twirl: np.ndarray | None = None,
 ) -> tuple[int, int]:
     """Write SetSpeed (and optionally SetHitsound) events for a hit timeline.
 
@@ -572,6 +718,10 @@ def write_actions(
             prev_vol = int(v[-1])
         else:
             vo_idx = np.empty(0, dtype=np.int64)
+        tw_idx = (
+            np.flatnonzero(twirl[start:start + len(gaps)])
+            if twirl is not None else np.empty(0, dtype=np.int64)
+        )
 
         for c0 in range(0, len(floors), ACTION_CHUNK):
             c1 = c0 + ACTION_CHUNK
@@ -580,6 +730,9 @@ def write_actions(
             items = [(int(i), 0, speed_fmt % (floors[i], speeds[i]))
                      for i in sp.tolist()]
             items += [(int(i), 1, vol_fmt % (floors[i], int(v[i]))) for i in vo.tolist()]
+            tw = tw_idx[(tw_idx >= c0) & (tw_idx < c1)]
+            items += [(int(i), 2, '{"floor":%d,"eventType":"Twirl"}' % floors[i])
+                      for i in tw.tolist()]
             if not items:
                 continue
             items.sort()
@@ -604,16 +757,18 @@ def write_chart(
     base_gap: float | None = None,
     theta: np.ndarray | None = None,
     mult: np.ndarray | None = None,
+    twirl: np.ndarray | None = None,
+    absolute: np.ndarray | None = None,
 ) -> tuple[int, int]:
     with output.open("w", encoding="utf-8", buffering=1024 * 1024) as f:
         f.write('{"angleData":[')
-        write_angles(f, len(hits), theta)  # floor 0 + one floor per hit
+        write_angles(f, len(hits), theta, absolute)  # floor 0 + one floor per hit
         f.write('],"settings":')
         f.write(json.dumps(settings, ensure_ascii=False, separators=(",", ":")))
         f.write(',"actions":[')
         counts = write_actions(
             f, hits, rate, volumes=volumes, hitsound=hitsound, base_gap=base_gap,
-            mult=mult,
+            mult=mult, twirl=twirl,
         )
         f.write('],"decorations":[]}')
     return counts
@@ -823,7 +978,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--path",
-        choices=("angle", "straight"),
+        choices=("angle", "lattice", "straight"),
         default="angle",
         help="angle: constant average BPM, gaps encoded as turn angles kept in "
         "90-270 deg by doubling/halving the speed. straight: all-straight route, "
@@ -836,6 +991,19 @@ def parse_args() -> argparse.Namespace:
         help="angle path: look-ahead depth (choice floors) when choosing between "
         "the two valid angle/speed forms to avoid overlaps; tries 2^depth "
         "combinations per step. 0 = off",
+    )
+    p.add_argument(
+        "--shape",
+        choices=("hexagram", "circle"),
+        default="hexagram",
+        help="lattice path: region the Twirl steering keeps the path inside",
+    )
+    p.add_argument(
+        "--fill",
+        type=float,
+        default=3.0,
+        help="lattice path: tiles per lattice point inside the shape (sets its size; "
+        "higher = smaller, denser shape with a crisper outline)",
     )
     p.add_argument(
         "--base-angle",
@@ -1127,8 +1295,23 @@ def main() -> int:
         initial_gap = max(1, int(hits[0]))
         initial_bpm = bpm_for_gap(args.rate, initial_gap)
         base_gap = None
-        theta = mult = None
-        if args.path == "angle":
+        theta = mult = twirl = absolute = None
+        if args.path == "lattice":
+            base_gap = float(LATTICE_SAMPLES_PER_BEAT)
+            initial_bpm = bpm_for_gap_f(args.rate, base_gap)
+            k, mult = lattice_plan(np.diff(np.asarray(hits, dtype=np.int64)))
+            radius = shape_radius(floors, args.shape, args.fill)
+            depth = args.steer_depth if args.steer_depth > 0 else 0
+            print(f"[4/5] Steering lattice path inside a {args.shape} "
+                  f"(radius {radius:,.0f}, depth {depth})...")
+            twirl = steer_lattice(k, depth, args.shape, radius)
+            absolute = lattice_angles(k, twirl)
+            cells = lattice_cells(k, twirl)
+            key = cells[:, 0] * 4_294_967_296 + cells[:, 1]
+            inside = in_shape(cells[:, 0], cells[:, 1], args.shape, radius).mean()
+            print(f"      overlapping floors: {1 - len(np.unique(key)) / len(key):.1%}, "
+                  f"inside shape: {inside:.1%}, Twirl: {int(twirl.sum()):,}")
+        elif args.path == "angle":
             avg_gap = (
                 (int(hits[-1]) - int(hits[0])) / (floors - 1) if floors > 1 else float(initial_gap)
             )
@@ -1172,6 +1355,8 @@ def main() -> int:
             base_gap=base_gap,
             theta=theta,
             mult=mult,
+            twirl=twirl,
+            absolute=absolute,
         )
         del hits, volumes
 

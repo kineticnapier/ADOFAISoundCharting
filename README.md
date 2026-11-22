@@ -142,6 +142,23 @@ floors landing on an already-used cell + 0.05 per speed change
 | `--steer-spread 0.002` | 23% | 17,309 (near-straight line) |
 | `--steer-spread 0.1` | 7% | 41,714 (straight line) |
 
+### `--path lattice` (magic circle)
+
+Modelled on ADOFAI "magic circle" charts: every tile direction is a multiple
+of 60°, so the route lives on a triangular lattice and draws hexagons/hexagrams.
+
+- Base BPM = `60·Fs/3`, i.e. **one sample = 60°**. Gaps of 1–5 samples are turns
+  of 60–300° at the base speed (no SetSpeed); longer gaps go straight with the
+  speed set to `3/gap`. Timing is exact (integer lattice, error < 1e-6 samples).
+- Direction is chosen with **Twirl**: reversing the rotation turns k·60° into
+  (6−k)·60° with the same timing (Twirl on floor j applies to floor j,
+  `scnGame` sets `isCCW` after toggling). The look-ahead search
+  (`--steer-depth`) picks Twirls that keep the path inside `--shape`
+  (`hexagram` or `circle`) and avoid revisiting cells.
+- `--fill` (default 3) = tiles per lattice point; it sets the shape's size.
+
+10 s clip, 100k tiles: 19,830 SetSpeed + ~150–500 Twirl, 2.6 MB.
+
 `straight`: every tile is 180°, every gap change is a SetSpeed (previous behaviour).
 
 ### `--engine tiles`
